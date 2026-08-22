@@ -8,9 +8,9 @@ import (
 	"os/user"
 	"runtime"
 	"strconv"
+	"sync"
 	"syscall"
 	"time"
-	"sync"
 
 	"golang.org/x/sys/unix"
 )

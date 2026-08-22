@@ -1,7 +1,7 @@
 package zip
 
 import (
-    "bufio"
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/binary"
@@ -21,7 +21,6 @@ import (
 
 	"golang.org/x/sync/errgroup"
 )
-
 
 type ExtractorOption func(*extractorOptions) error
 
@@ -507,17 +506,17 @@ func (e *Extractor) Extract(ctx context.Context) (err error) {
 
 				// Overwrite control policies
 				if file.Mode()&os.ModeDir == 0 && file.Mode()&os.ModeSymlink == 0 && file.Linkname == "" {
-				if e.options.unlinkFirst {
-					os.RemoveAll(fixOSPath(path)) // Safer than os.Remove for preventing TOCTOU directory overwrites
-				}
-				if e.options.keepOldFiles {
-					if _, err := os.Stat(fixOSPath(path)); err == nil {
-						continue // Skip extracting, file already exists
+					if e.options.unlinkFirst {
+						os.RemoveAll(fixOSPath(path)) // Safer than os.Remove for preventing TOCTOU directory overwrites
 					}
-				}
-				if e.options.keepNewerFiles {
-					if fi, err := os.Stat(fixOSPath(path)); err == nil {
-						if fi.ModTime().After(file.Modified) {
+					if e.options.keepOldFiles {
+						if _, err := os.Stat(fixOSPath(path)); err == nil {
+							continue // Skip extracting, file already exists
+						}
+					}
+					if e.options.keepNewerFiles {
+						if fi, err := os.Stat(fixOSPath(path)); err == nil {
+							if fi.ModTime().After(file.Modified) {
 								continue // Skip extracting, disk file is newer
 							}
 						}
@@ -560,7 +559,7 @@ func (e *Extractor) Extract(ctx context.Context) (err error) {
 			return waitErr
 		}
 
-        for _, file := range e.zr.File {
+		for _, file := range e.zr.File {
 			if file.Mode()&os.ModeSymlink == 0 && file.Linkname == "" {
 				continue
 			}

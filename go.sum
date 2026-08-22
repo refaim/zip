@@ -4,8 +4,8 @@ github.com/danielmorsing/gonzbee v0.0.0-20170928120813-4deb2f96db05 h1:tmM1ENb3Z
 github.com/danielmorsing/gonzbee v0.0.0-20170928120813-4deb2f96db05/go.mod h1:/By0gd1aCX/bU4xZTGTqg4vWxhY/RqtMlgvH66IpW6w=
 github.com/dovydenkovas/ppmd v0.1.1 h1:wCVB/jl4mnPx3W5FIdBxKm82uKwWIisFBJm1VOZK00A=
 github.com/dovydenkovas/ppmd v0.1.1/go.mod h1:lMAln/NEOrXvg1CwQEs+Rkiqrcd+xwi2Fy5yYAXpp7M=
-github.com/klauspost/compress v1.18.7-0.20260521203646-ecdb779d8745 h1:YHIbRzXZTz1KOq5ges6vri9di7b+AcbE0GySH3+v2eU=
-github.com/klauspost/compress v1.18.7-0.20260521203646-ecdb779d8745/go.mod h1:cwPg85FWrGar70rWktvGQj8/hthj3wpl0PGDogxkrSQ=
+github.com/klauspost/compress v1.19.2 h1:hMRETovs/pu/dVWN7zIT1PGG8t509MwT6bO7XSi26R8=
+github.com/klauspost/compress v1.19.2/go.mod h1:cwPg85FWrGar70rWktvGQj8/hthj3wpl0PGDogxkrSQ=
 github.com/klauspost/cpuid/v2 v2.0.2 h1:pd2FBxFydtPn2ywTLStbFg9CJKrojATnpeJWSP7Ys4k=
 github.com/klauspost/cpuid/v2 v2.0.2/go.mod h1:FInQzS24/EEf25PyTYn52gqo7WaD8xa0213Md/qVLRg=
 github.com/unxed/localecp v0.1.4 h1:2kJ6ABrv69tl90I0A+4W7zWlVjbVtNTQqs4R+HmrH9c=

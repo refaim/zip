@@ -4,10 +4,10 @@
 package zip
 
 import (
-    "sync"
 	"os"
 	"os/user"
 	"strconv"
+	"sync"
 	"syscall"
 )
 
