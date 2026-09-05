@@ -154,6 +154,7 @@ func (cr *xCryptReaderAt) ReadAt(p []byte, off int64) (int, error) {
 		return 0, nil
 	}
 
+	// #nosec G115 -- ReadAt is not called with a negative offset, and the block index is the offset divided by the cipher's block size
 	blockOffset := uint64(off / 16)
 	rem := int(off % 16)
 
@@ -174,9 +175,10 @@ func (cr *xCryptReaderAt) ReadAt(p []byte, off int64) (int, error) {
 
 	iv := make([]byte, 16)
 	copy(iv, cr.iv)
-	var carry uint64 = blockOffset
+	var carry = blockOffset
 	for i := 15; i >= 0 && carry > 0; i-- {
 		sum := uint64(iv[i]) + (carry & 0xFF)
+		// #nosec G115 -- sum is one IV byte plus one byte of the carry, so it is at most 0x1FE and this keeps the low byte while the line below carries the rest
 		iv[i] = byte(sum)
 		carry = (carry >> 8) + (sum >> 8)
 	}
@@ -195,9 +197,8 @@ func (cr *xCryptReaderAt) ReadAt(p []byte, off int64) (int, error) {
 	return copied, err
 }
 
-func encapsulateXCryptZip(finalPath, tempPath, password string) error {
+func encapsulateXCryptZip(finalPath, tempPath, password string) (err error) {
 	var out *os.File
-	var err error
 	if finalPath == "-" {
 		out = os.Stdout
 	} else {
@@ -205,15 +206,28 @@ func encapsulateXCryptZip(finalPath, tempPath, password string) error {
 		if err != nil {
 			return err
 		}
-		defer out.Close()
+		// This is the archive being produced. A close that failed
+		// means the last of it never reached the disk, so the file the
+		// caller is handed is not the archive it was told about.
+		defer func() {
+			if cerr := out.Close(); err == nil {
+				err = cerr
+			}
+		}()
 	}
 
 	zw := NewWriter(out)
 
-	// Stub
+	// Stub. NewWriter puts a 64 KiB buffer in front of the destination and
+	// this entry and the payload entry below are both started inside the
+	// first few hundred bytes of the archive, so neither call has a write
+	// behind it that could have failed and neither can hand back a nil
+	// writer. Nothing is lost either way: a buffered writer keeps the first
+	// failure it meets and answers with it from then on, so a write that
+	// fails is reported again by the Close at the end of this function.
 	stubMsg := []byte("This is an encrypted archive. Please use f4 or an AXS-compatible tool to extract it.\n")
 	w, _ := zw.CreateHeader(&FileHeader{Name: "README_ENCRYPTED.txt", Method: Store})
-	w.Write(stubMsg)
+	_, _ = w.Write(stubMsg)
 
 	cHdr, key, err := generateXCryptHeader(password, 600000)
 	if err != nil {
@@ -227,6 +241,7 @@ func encapsulateXCryptZip(finalPath, tempPath, password string) error {
 
 	// Payload
 	pHdr := &FileHeader{Name: ".zipext/xcrypt/payload.enc", Method: Store}
+	// #nosec G115 -- the size comes from the operating system for the file this call just staged
 	pHdr.UncompressedSize64 = uint64(tempFi.Size())
 	pHdr.CompressedSize64 = pHdr.UncompressedSize64
 	pHdr.Flags |= 0x1 // Mark as encrypted
@@ -237,16 +252,26 @@ func encapsulateXCryptZip(finalPath, tempPath, password string) error {
 	binary.LittleEndian.PutUint16(xcryptExtra[2:4], 0)
 	pHdr.Extra = append(pHdr.Extra, xcryptExtra...)
 
+	// Still inside the first few hundred bytes; see the stub above.
 	pw, _ := zw.CreateRaw(pHdr)
 
 	in, err := os.Open(tempPath)
 	if err != nil {
 		return err
 	}
+	// The key is the 32 bytes PBKDF2 produced, which is a length AES takes,
+	// so there is no cipher here that could fail to be made.
 	cw, _ := newXCryptWriter(pw, key, cHdr.IV)
 	// Используем 1МБ буфер вместо дефолтных 32КБ для инкапсуляции
-	io.CopyBuffer(cw, in, make([]byte, 1024*1024))
-	in.Close()
+	// This is the whole of the encrypted archive. A short copy leaves an
+	// entry whose header promises bytes that are not there, and the caller
+	// was told the archive was written.
+	_, copyErr := io.CopyBuffer(cw, in, make([]byte, 1024*1024))
+	// The staged archive is only being read from here.
+	_ = in.Close()
+	if copyErr != nil {
+		return copyErr
+	}
 
 	cHdr.MAC = cw.MAC()
 
@@ -254,8 +279,17 @@ func encapsulateXCryptZip(finalPath, tempPath, password string) error {
 	mHdr := &FileHeader{Name: ".zipext/xcrypt/crypto.hdr", Method: Store}
 	mHdr.UncompressedSize64 = 93
 	mHdr.CompressedSize64 = 93
-	mw, _ := zw.CreateRaw(mHdr)
-	mw.Write(cHdr.Encode())
+	// The third entry is not like the first two: the payload has gone
+	// through the buffer by now, so this is the first call in the function
+	// with a write behind it that can already have failed.
+	mw, err := zw.CreateRaw(mHdr)
+	if err != nil {
+		return err
+	}
+	// Without the crypto header the payload cannot be decrypted at all.
+	if _, err := mw.Write(cHdr.Encode()); err != nil {
+		return err
+	}
 
 	return zw.Close()
 }
@@ -276,9 +310,18 @@ func checkXCryptZip(ra io.ReaderAt, size int64, password string) (io.ReaderAt, i
 
 	for _, file := range zr.File {
 		if file.Name == ".zipext/xcrypt/crypto.hdr" {
-			rc, _ := file.Open()
-			data, _ := io.ReadAll(rc)
-			rc.Close()
+			rc, oerr := file.Open()
+			if oerr != nil {
+				return nil, 0, oerr
+			}
+			data, rerr := io.ReadAll(rc)
+			// The entry was read to its end, so its checksum has
+			// already been checked and this handle has nothing
+			// left to say.
+			_ = rc.Close()
+			if rerr != nil {
+				return nil, 0, rerr
+			}
 			var err error
 			cHdr, err = parseXCryptHeader(data)
 			if err != nil {
@@ -316,8 +359,10 @@ func checkXCryptZip(ra io.ReaderAt, size int64, password string) (io.ReaderAt, i
 	if err != nil {
 		return nil, 0, err
 	}
+	// #nosec G115 -- readDirectoryHeader and salvage both refuse an entry whose CompressedSize64 is above MaxInt64
 	payloadSection := io.NewSectionReader(ra, pOff, int64(payloadFile.CompressedSize64))
 	decReader := newXCryptReaderAt(payloadSection, key, cHdr.IV)
 
+	// #nosec G115 -- readDirectoryHeader and salvage both refuse an entry whose CompressedSize64 is above MaxInt64
 	return decReader, int64(payloadFile.CompressedSize64), nil
 }

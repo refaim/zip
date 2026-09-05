@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"io"
 	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -46,11 +47,15 @@ func mustBinaryWrite(t *testing.T, w io.Writer, order binary.ByteOrder, v any) {
 	}
 }
 
-// mustWriteFile creates path with the given contents and mode.
+// mustWriteFile creates path with the given contents and mode. Every caller
+// assembles path from the t.TempDir the test owns; cleaning it here is what
+// makes the file written and the file named in the failure message the same
+// one when a fixture path picks up a ".." or a doubled separator on the way.
 func mustWriteFile(t *testing.T, path string, data []byte, mode os.FileMode) {
 	t.Helper()
-	if err := os.WriteFile(path, data, mode); err != nil {
-		t.Fatalf("write %s: %v", path, err)
+	target := filepath.Clean(path)
+	if err := os.WriteFile(target, data, mode); err != nil {
+		t.Fatalf("write %s: %v", target, err)
 	}
 }
 

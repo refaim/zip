@@ -5,6 +5,7 @@ import (
 	"crypto/cipher"
 	"crypto/hmac"
 	"crypto/rand"
+	// #nosec G505 -- WinZip AES (APPNOTE 6.3.x) requires PBKDF2-HMAC-SHA1 and an HMAC-SHA1 authentication code; changing the algorithm breaks the format
 	"crypto/sha1"
 	"errors"
 	"hash"
@@ -21,13 +22,11 @@ type winzipAesInfo struct {
 }
 
 type aesReader struct {
-	r          io.Reader
-	baseR      io.Reader
-	decrypter  cipher.Stream
-	mac        hash.Hash
-	authCode   []byte
-	expectedAC []byte
-	err        error
+	r         io.Reader
+	baseR     io.Reader
+	decrypter cipher.Stream
+	mac       hash.Hash
+	err       error
 }
 
 func (ar *aesReader) Read(p []byte) (int, error) {
@@ -124,9 +123,10 @@ func newWinZipAesReader(r io.Reader, password string, info *winzipAesInfo, compr
 func addIVBigEndian(baseIV []byte, offset uint64) []byte {
 	iv := make([]byte, 16)
 	copy(iv, baseIV)
-	var carry uint64 = offset
+	var carry = offset
 	for i := 15; i >= 0 && carry > 0; i-- {
 		sum := uint64(iv[i]) + (carry & 0xFF)
+		// #nosec G115 -- sum is one IV byte plus one byte of the carry, so it is at most 0x1FE and this keeps the low byte while the line below carries the rest
 		iv[i] = byte(sum)
 		carry = (carry >> 8) + (sum >> 8)
 	}

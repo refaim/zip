@@ -185,13 +185,13 @@ func TestReader_RejectsCompressedSizeAboveMaxInt64(t *testing.T) {
 // is then negative, and every read of the entry starts from wherever that
 // lands.
 func TestReader_RejectsHeaderOffsetAboveMaxInt64(t *testing.T) {
-	body := []byte("small")
+	const body = "small"
 	raw := rawEntryArchive(t, &FileHeader{
 		Name:               "offset.bin",
 		Method:             Store,
 		CompressedSize64:   1 << 63,
 		UncompressedSize64: uint64(len(body)),
-	}, body)
+	}, []byte(body))
 
 	cd := centralHeaderOffset(t, raw, "offset.bin")
 	binary.LittleEndian.PutUint32(raw[cd+20:], uint32(len(body))) // compressed size, no longer asked of the extra
@@ -533,8 +533,12 @@ func TestOpenSeekable_HiddenIndexDeclaredSizeAboveMaxInt64(t *testing.T) {
 	nameLen := int(binary.LittleEndian.Uint16(raw[header+26:]))
 	extraLen := int(binary.LittleEndian.Uint16(raw[header+28:]))
 	at := header + fileHeaderLen + nameLen + extraLen
+	grownExtraLen, err := fitUint16(extraLen+len(extra), "local header extra field")
+	if err != nil {
+		t.Fatal(err)
+	}
 	binary.LittleEndian.PutUint32(raw[header+18:], uint32max)
-	binary.LittleEndian.PutUint16(raw[header+28:], uint16(extraLen+len(extra)))
+	binary.LittleEndian.PutUint16(raw[header+28:], grownExtraLen)
 
 	forged := append([]byte(nil), raw[:at]...)
 	forged = append(forged, extra[:]...)
@@ -906,7 +910,10 @@ func TestExtractor_SolidFallbackRatioNotDoubleCharged(t *testing.T) {
 	// Rounded up, since the limit is exact: the entry expands by this much
 	// per byte and no more.
 	u, c := zr.File[0].UncompressedSize64, zr.File[0].CompressedSize64
-	ratio := int64((u + c - 1) / c)
+	ratio, err := u64toi64((u + c - 1) / c)
+	if err != nil {
+		t.Fatalf("ratio of the archive just written: %v", err)
+	}
 
 	_, dst, err := extractArchiveTo(t, raw, WithExtractorMaxFileSize(0), WithExtractorMaxRatio(ratio))
 	if err != nil {

@@ -20,7 +20,7 @@ func TestUnixLinks_Zip(t *testing.T) {
 	mustMkdirAll(t, srcDir)
 
 	targetPath := filepath.Join(srcDir, "target.txt")
-	if err := os.WriteFile(targetPath, []byte("link_target"), 0644); err != nil {
+	if err := os.WriteFile(targetPath, []byte("link_target"), 0600); err != nil {
 		t.Fatalf("Failed to create target file: %v", err)
 	}
 
@@ -412,11 +412,11 @@ func TestExtractor_IncrementalSweepReportsWhatItCannotDo(t *testing.T) {
 		if err := os.MkdirAll(dir, 0755); err != nil {
 			t.Fatal(err)
 		}
-		if err := os.WriteFile(filepath.Join(dstDir, ".zip_dumpdir"), []byte("\n"), 0644); err != nil {
+		if err := os.WriteFile(filepath.Join(dstDir, ".zip_dumpdir"), []byte("\n"), 0600); err != nil {
 			t.Fatal(err)
 		}
 		if stale {
-			if err := os.WriteFile(filepath.Join(dir, "stale.txt"), []byte("stale"), 0644); err != nil {
+			if err := os.WriteFile(filepath.Join(dir, "stale.txt"), []byte("stale"), 0600); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -462,5 +462,44 @@ func TestExtractor_IncrementalSweepReportsWhatItCannotDo(t *testing.T) {
 				t.Fatal("the sweep reported success on a destination it could not finish")
 			}
 		})
+	}
+}
+
+// TestApplyXattrsIsBestEffort covers the extended attribute pass. Setting one
+// fails with ENOTSUP on every filesystem that has nowhere to keep it, and the
+// filesystem under a test is whichever one TMPDIR is on, so what this asserts
+// is the part that has to hold either way: the pass reports success. Whether
+// the attribute stuck is the filesystem's business and not the extraction's.
+func TestApplyXattrsIsBestEffort(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "attrs.txt")
+	mustWriteFile(t, path, []byte("data"), 0600)
+
+	hdr := &FileHeader{Name: "attrs.txt", Xattrs: map[string]string{"user.zip_test": "value"}}
+	if err := applyXattrs(path, hdr); err != nil {
+		t.Errorf("applyXattrs on a best-effort pass: %v", err)
+	}
+
+	// An entry with nothing to apply stops before the loop.
+	if err := applyXattrs(path, &FileHeader{Name: "attrs.txt"}); err != nil {
+		t.Errorf("applyXattrs with no attributes: %v", err)
+	}
+}
+
+// TestSysPlatformExtraDevice covers the device arm of the header pass. A
+// character device on the system carries a major and a minor the kernel
+// reports, and /dev/null is the one device every Unix has at a fixed place.
+func TestSysPlatformExtraDevice(t *testing.T) {
+	fi, err := os.Stat("/dev/null")
+	if err != nil {
+		t.Skipf("no /dev/null to read a device number from: %v", err)
+	}
+	if fi.Mode()&os.ModeCharDevice == 0 {
+		t.Skipf("/dev/null is not a character device here: mode %v", fi.Mode())
+	}
+
+	var hdr FileHeader
+	sysPlatformExtra(fi, &hdr)
+	if hdr.Devmajor == 0 && hdr.Devminor == 0 {
+		t.Errorf("no device number came back for /dev/null: %d:%d", hdr.Devmajor, hdr.Devminor)
 	}
 }

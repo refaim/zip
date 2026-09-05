@@ -3,14 +3,18 @@ package zip
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/unxed/zip/internal/filepool"
 )
 
 func TestArchiverAndExtractor(t *testing.T) {
@@ -27,7 +31,7 @@ func TestArchiverAndExtractor(t *testing.T) {
 	for path, content := range filesToCreate {
 		fullPath := filepath.Join(srcDir, path)
 		mustMkdirAll(t, filepath.Dir(fullPath))
-		if err := os.WriteFile(fullPath, []byte(content), 0644); err != nil {
+		if err := os.WriteFile(fullPath, []byte(content), 0600); err != nil {
 			t.Fatalf("failed to create test file: %v", err)
 		}
 	}
@@ -620,7 +624,7 @@ func TestArchiver_CompressionHeuristics(t *testing.T) {
 	textPath := filepath.Join(srcDir, "small_text.txt")
 	var textBuf bytes.Buffer
 	for i := 0; i < 500; i++ {
-		textBuf.WriteString(fmt.Sprintf("line %d: some unique text content here\n", i))
+		fmt.Fprintf(&textBuf, "line %d: some unique text content here\n", i)
 	}
 	mustWriteFile(t, textPath, textBuf.Bytes(), 0644)
 
@@ -757,7 +761,7 @@ func TestArchiver_ParallelEncryption(t *testing.T) {
 	for path, content := range filesToCreate {
 		fullPath := filepath.Join(srcDir, path)
 		mustMkdirAll(t, filepath.Dir(fullPath))
-		if err := os.WriteFile(fullPath, []byte(content), 0644); err != nil {
+		if err := os.WriteFile(fullPath, []byte(content), 0600); err != nil {
 			t.Fatalf("failed to create test file: %v", err)
 		}
 	}
@@ -866,7 +870,7 @@ func TestArchiver_ErrorWithIdleWorkersReturns(t *testing.T) {
 	files := make(map[string]os.FileInfo)
 	add := func(name string, wrap bool) {
 		p := filepath.Join(srcDir, name)
-		if err := os.WriteFile(p, []byte("payload"), 0644); err != nil {
+		if err := os.WriteFile(p, []byte("payload"), 0600); err != nil {
 			t.Fatal(err)
 		}
 		fi, err := os.Stat(p)
@@ -909,5 +913,298 @@ func TestArchiver_ErrorWithIdleWorkersReturns(t *testing.T) {
 		buf := make([]byte, 1<<16)
 		n := runtime.Stack(buf, true)
 		t.Fatalf("Archive did not return within 30s, workers are still waiting on the task channel:\n%s", buf[:n])
+	}
+}
+
+// seekFailReader is a ReadSeeker whose seeks stop working from the nth one on,
+// the way a file whose disk has gone away does. The reads keep working, so the
+// failure is the rewind and nothing else.
+type seekFailReader struct {
+	r      *bytes.Reader
+	failAt int
+	seeks  int
+	err    error
+}
+
+func (s *seekFailReader) Read(p []byte) (int, error) { return s.r.Read(p) }
+
+func (s *seekFailReader) Seek(offset int64, whence int) (int64, error) {
+	s.seeks++
+	if s.seeks >= s.failAt {
+		return 0, s.err
+	}
+	return s.r.Seek(offset, whence)
+}
+
+// expandingCompressor is a compressor that makes an entry twice the size it
+// was, which is the case the fall back to Store exists for. A real compressor
+// expands incompressible data by a fraction of a percent, so a file large
+// enough to cross the archiver's threshold that way would be tens of
+// megabytes of test fixture.
+type expandingCompressor struct{ w io.Writer }
+
+func (e expandingCompressor) Write(p []byte) (int, error) {
+	for i := 0; i < 2; i++ {
+		if _, err := e.w.Write(p); err != nil {
+			return 0, err
+		}
+	}
+	return len(p), nil
+}
+
+func (e expandingCompressor) Close() error { return nil }
+
+// mixedEntropyBytes returns n bytes over 200 distinct values, which is what
+// the archiver's heuristic reads as "worth deflating": too many distinct bytes
+// to be worth Huffman coding alone, too few to look like data that is already
+// compressed.
+func mixedEntropyBytes(n int) []byte {
+	data := make([]byte, n)
+	for i := range data {
+		data[i] = byte(i % 200)
+	}
+	return data
+}
+
+// highEntropyBytes returns n bytes over all 256 values, evenly enough spread
+// that the archiver's heuristic reads them as data that is already compressed
+// and not worth deflating a second time. The generator is a plain xorshift so
+// that the fixture is the same on every run.
+func highEntropyBytes(n int) []byte {
+	data := make([]byte, 0, n+4)
+	x := uint32(2463534242)
+	var word [4]byte
+	for len(data) < n {
+		x ^= x << 13
+		x ^= x >> 17
+		x ^= x << 5
+		binary.LittleEndian.PutUint32(word[:], x)
+		data = append(data, word[:]...)
+	}
+	return data[:n]
+}
+
+// TestArchiver_CompressFileStoresWhatIsAlreadyCompressed covers the other
+// answer the peek can give: a file the heuristic reads as incompressible is
+// stored, and the compressor is never asked about it.
+func TestArchiver_CompressFileStoresWhatIsAlreadyCompressed(t *testing.T) {
+	var buf bytes.Buffer
+	a, err := NewArchiver(&buf, t.TempDir())
+	if err != nil {
+		t.Fatalf("building the archiver: %v", err)
+	}
+	closeAt(t, a)
+
+	fp, err := filepool.New(t.TempDir(), 1, -1)
+	if err != nil {
+		t.Fatalf("building the file pool: %v", err)
+	}
+	closeAt(t, fp)
+
+	data := highEntropyBytes(8192)
+	hdr := &FileHeader{Name: "entry.bin", Method: Deflate, UncompressedSize64: uint64(len(data))}
+	hdr.SetMode(0644)
+	fi := mockFileInfo{name: "entry.bin", mode: 0644}
+
+	if err := a.compressFile(context.Background(), bytes.NewReader(data), fi, hdr, fp.Get()); err != nil {
+		t.Fatalf("compressFile: %v", err)
+	}
+	if hdr.Method != Store {
+		t.Errorf("the entry was written with method %d, want Store", hdr.Method)
+	}
+}
+
+// TestArchiver_CompressFileReturnsAFailedPeekRewind covers the rewind after
+// the archiver peeks at the head of a file to decide how to compress it. The
+// peek has to be given back before the file is read for real: a rewind that
+// did not happen puts the first 64 KiB into the entry twice over, under the
+// checksum of a file that has neither.
+func TestArchiver_CompressFileReturnsAFailedPeekRewind(t *testing.T) {
+	var buf bytes.Buffer
+	a, err := NewArchiver(&buf, t.TempDir())
+	if err != nil {
+		t.Fatalf("building the archiver: %v", err)
+	}
+	closeAt(t, a)
+
+	data := mixedEntropyBytes(8192)
+	hdr := &FileHeader{Name: "entry.bin", Method: Deflate, UncompressedSize64: uint64(len(data))}
+	hdr.SetMode(0644)
+
+	gone := errors.New("the file went away")
+	r := &seekFailReader{r: bytes.NewReader(data), failAt: 1, err: gone}
+	fi := mockFileInfo{name: "entry.bin", mode: 0644}
+
+	if err := a.compressFile(context.Background(), r, fi, hdr, nil); !errors.Is(err, gone) {
+		t.Fatalf("compressFile returned %v, want %v", err, gone)
+	}
+}
+
+// TestArchiver_CompressFileFallsBackToStore covers an entry that came out of
+// the compressor larger than it went in. The file is read a second time and
+// stored instead, and the rewind between the two passes is what makes the
+// second pass see the whole file rather than what was left after the first.
+func TestArchiver_CompressFileFallsBackToStore(t *testing.T) {
+	var buf bytes.Buffer
+	a, err := NewArchiver(&buf, t.TempDir())
+	if err != nil {
+		t.Fatalf("building the archiver: %v", err)
+	}
+	closeAt(t, a)
+	a.zw.RegisterCompressor(Deflate, func(w io.Writer) (io.WriteCloser, error) {
+		return expandingCompressor{w}, nil
+	})
+
+	fp, err := filepool.New(t.TempDir(), 1, -1)
+	if err != nil {
+		t.Fatalf("building the file pool: %v", err)
+	}
+	closeAt(t, fp)
+
+	data := mixedEntropyBytes(8192)
+	hdr := &FileHeader{Name: "entry.bin", Method: Deflate, UncompressedSize64: uint64(len(data))}
+	hdr.SetMode(0644)
+	fi := mockFileInfo{name: "entry.bin", mode: 0644}
+
+	if err := a.compressFile(context.Background(), bytes.NewReader(data), fi, hdr, fp.Get()); err != nil {
+		t.Fatalf("compressFile: %v", err)
+	}
+	if hdr.Method != Store {
+		t.Errorf("the entry was written with method %d, want Store", hdr.Method)
+	}
+	if err := a.Close(); err != nil {
+		t.Fatalf("closing the archiver: %v", err)
+	}
+
+	zr, err := NewReader(bytes.NewReader(buf.Bytes()), int64(buf.Len()))
+	if err != nil {
+		t.Fatalf("reading the archive back: %v", err)
+	}
+	if len(zr.File) != 1 {
+		t.Fatalf("the archive holds %d entries, want 1", len(zr.File))
+	}
+	rc, err := zr.File[0].Open()
+	if err != nil {
+		t.Fatalf("opening the entry: %v", err)
+	}
+	closeAt(t, rc)
+	got, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatalf("reading the entry: %v", err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Errorf("the stored entry is %d bytes, want the %d that went in", len(got), len(data))
+	}
+}
+
+// TestArchiver_CompressFileReturnsAFailedStoreRewind covers the second rewind
+// failing. Without it the entry would be written from wherever the compressed
+// pass left the file, which is the end of it.
+func TestArchiver_CompressFileReturnsAFailedStoreRewind(t *testing.T) {
+	var buf bytes.Buffer
+	a, err := NewArchiver(&buf, t.TempDir())
+	if err != nil {
+		t.Fatalf("building the archiver: %v", err)
+	}
+	closeAt(t, a)
+	a.zw.RegisterCompressor(Deflate, func(w io.Writer) (io.WriteCloser, error) {
+		return expandingCompressor{w}, nil
+	})
+
+	fp, err := filepool.New(t.TempDir(), 1, -1)
+	if err != nil {
+		t.Fatalf("building the file pool: %v", err)
+	}
+	closeAt(t, fp)
+
+	data := mixedEntropyBytes(8192)
+	hdr := &FileHeader{Name: "entry.bin", Method: Deflate, UncompressedSize64: uint64(len(data))}
+	hdr.SetMode(0644)
+	fi := mockFileInfo{name: "entry.bin", mode: 0644}
+
+	gone := errors.New("the file went away")
+	// The first seek is the peek's rewind and still works; the second is
+	// the one before the file is stored.
+	r := &seekFailReader{r: bytes.NewReader(data), failAt: 2, err: gone}
+
+	if err := a.compressFile(context.Background(), r, fi, hdr, fp.Get()); !errors.Is(err, gone) {
+		t.Fatalf("compressFile returned %v, want %v", err, gone)
+	}
+}
+
+// TestArchiver_XattrsOnLinksAndSpecialFiles covers reading extended attributes
+// for the entries that are not ordinary files: a hard link, and a named pipe
+// on both the archiver's serial path and its worker path. Reading them is best
+// effort whatever the archiver is set to -- it fails on what the source
+// filesystem holds rather than on the file, so FAT, exFAT, SMB shares and
+// tmpfs would each turn archiving into a failure for carrying no attributes at
+// all -- so what is pinned here is that the entries come out whole with the
+// option on.
+func TestArchiver_XattrsOnLinksAndSpecialFiles(t *testing.T) {
+	srcDir := t.TempDir()
+
+	pipeHdr := &FileHeader{Name: "pipe"}
+	pipeHdr.SetMode(os.ModeNamedPipe | 0644)
+	pipePath := filepath.Join(srcDir, "pipe")
+	if err := extractSpecialFile(pipePath, pipeHdr); err != nil {
+		t.Skipf("named pipes are not available here: %v", err)
+	}
+	if fi, err := os.Lstat(pipePath); err != nil || fi.Mode()&os.ModeNamedPipe == 0 {
+		t.Skip("named pipes are not available here")
+	}
+
+	target := filepath.Join(srcDir, "target.txt")
+	mustWriteFile(t, target, []byte("linked"), 0o600)
+	if err := os.Link(target, filepath.Join(srcDir, "hard.txt")); err != nil {
+		t.Skipf("hard links are not available here: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name        string
+		concurrency int
+	}{
+		// One worker means the archiver writes the special file on the
+		// loop's own goroutine; more than one sends it to a worker, and
+		// the attributes are read on each path separately.
+		{"serial", 1},
+		{"parallel", 4},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			files := walkFilesFor(t, srcDir)
+			var buf bytes.Buffer
+			a, err := NewArchiver(&buf, srcDir,
+				WithArchiverXattrs(true),
+				WithArchiverConcurrency(tc.concurrency))
+			if err != nil {
+				t.Fatalf("building the archiver: %v", err)
+			}
+			closeAt(t, a)
+			if err := a.Archive(context.Background(), files); err != nil {
+				t.Fatalf("archiving: %v", err)
+			}
+			if err := a.Close(); err != nil {
+				t.Fatalf("closing the archiver: %v", err)
+			}
+
+			zr, err := NewReader(bytes.NewReader(buf.Bytes()), int64(buf.Len()))
+			if err != nil {
+				t.Fatalf("reading the archive back: %v", err)
+			}
+			var sawPipe, sawLink bool
+			for _, f := range zr.File {
+				if f.Name == "pipe" && f.Mode()&os.ModeNamedPipe != 0 {
+					sawPipe = true
+				}
+				if f.Linkname != "" {
+					sawLink = true
+				}
+			}
+			if !sawPipe {
+				t.Error("the named pipe did not come out as a named pipe")
+			}
+			if !sawLink {
+				t.Error("neither of the two names came out as a hard link to the other")
+			}
+		})
 	}
 }

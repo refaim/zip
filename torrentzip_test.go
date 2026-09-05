@@ -163,10 +163,15 @@ func TestWithArchiverTorrentZip_SetsLevel9(t *testing.T) {
 func TestTorrentZip_BitExactWithReference(t *testing.T) {
 	tmp := t.TempDir()
 
-	// 1. Проверяем наличие "trrntzip" или "torrentzip" в PATH
+	// 1. Проверяем наличие "trrntzip" или "torrentzip" в PATH.
+	// A lookup that reports an error has named nothing usable, so the path is
+	// left empty and the build from the sibling checkout below takes over.
 	trrntzipPath, err := exec.LookPath("trrntzip")
 	if err != nil {
 		trrntzipPath, err = exec.LookPath("torrentzip")
+	}
+	if err != nil {
+		trrntzipPath = ""
 	}
 
 	var buildErr error
@@ -203,7 +208,7 @@ func TestTorrentZip_BitExactWithReference(t *testing.T) {
 	// который будет сжиматься по-разному в Go flate и C zlib
 	var buf bytes.Buffer
 	for buf.Len() < 655360 {
-		buf.WriteString(fmt.Sprintf("This is some highly structured and repeating data that will test the LZ77 match finder differences between standard Go flate and C zlib. Line number: %d\n", buf.Len()))
+		fmt.Fprintf(&buf, "This is some highly structured and repeating data that will test the LZ77 match finder differences between standard Go flate and C zlib. Line number: %d\n", buf.Len())
 	}
 
 	mustWriteFile(t, filepath.Join(srcDir, "Aaargh!.trd"), buf.Bytes()[:655360], 0644)

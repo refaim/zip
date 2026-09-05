@@ -252,7 +252,8 @@ func NewArchiver(w io.Writer, chroot string, opts ...ArchiverOption) (*Archiver,
 	}
 
 	if a.options.level != 0 {
-		if a.options.method == Deflate {
+		switch a.options.method {
+		case Deflate:
 			a.zw.RegisterCompressor(Deflate, func(w io.Writer) (io.WriteCloser, error) {
 				if a.options.torrentZip {
 					szw := &tzStripZlibWriter{w: w}
@@ -264,11 +265,11 @@ func NewArchiver(w io.Writer, chroot string, opts ...ArchiverOption) (*Archiver,
 				}
 				return newFlateWriterLevel(w, a.options.level), nil
 			})
-		} else if a.options.method == ZSTD {
+		case ZSTD:
 			a.zw.RegisterCompressor(ZSTD, func(w io.Writer) (io.WriteCloser, error) {
 				return newZstdWriterLevel(w, a.options.level)
 			})
-		} else if a.options.method == LZMA {
+		case LZMA:
 			a.zw.RegisterCompressor(LZMA, func(w io.Writer) (io.WriteCloser, error) {
 				return newLZMAWriter(w, a.options.level)
 			})
@@ -337,12 +338,16 @@ func (a *Archiver) Archive(ctx context.Context, files map[string]os.FileInfo) (e
 			for name := range files {
 				path, err := filepath.Abs(name)
 				if err != nil {
-					innerZw.Close()
+					// The archive is being abandoned; what
+					// closing its writer says about the
+					// central directory does not matter
+					// beside the error being returned.
+					_ = innerZw.Close()
 					return err
 				}
 				rel, err := filepath.Rel(a.chroot, path)
 				if err != nil {
-					innerZw.Close()
+					_ = innerZw.Close()
 					return err
 				}
 				relClean := filepath.ToSlash(rel)
@@ -362,10 +367,17 @@ func (a *Archiver) Archive(ctx context.Context, files map[string]os.FileInfo) (e
 			}
 			innerW, err := innerZw.CreateHeader(fh)
 			if err != nil {
-				innerZw.Close()
+				_ = innerZw.Close()
 				return err
 			}
-			innerW.Write([]byte(dumpdirContent))
+			// The listing is what tells an incremental extraction
+			// which files the archive still has; a short write
+			// leaves an entry whose header promises bytes that are
+			// not there, and every reader sees a corrupt archive.
+			if _, werr := innerW.Write([]byte(dumpdirContent)); werr != nil {
+				_ = innerZw.Close()
+				return werr
+			}
 		}
 
 		innerA := &Archiver{
@@ -395,7 +407,12 @@ func (a *Archiver) Archive(ctx context.Context, files map[string]os.FileInfo) (e
 
 		err = innerA.Archive(ctx, files)
 		close(progressDone)
-		innerZw.Close()
+		// Closing the inner writer writes the inner archive's central
+		// directory. Dropping the error handed back an outer archive
+		// holding an inner one with no directory, reported as success.
+		if cerr := innerZw.Close(); err == nil {
+			err = cerr
+		}
 
 		atomic.StoreInt64(&a.written, atomic.LoadInt64(&innerA.written))
 		atomic.StoreInt64(&a.entries, atomic.LoadInt64(&innerA.entries))
@@ -598,13 +615,19 @@ func (a *Archiver) Archive(ctx context.Context, files map[string]os.FileInfo) (e
 		switch {
 		case hdr.Mode()&os.ModeSymlink != 0:
 			if a.options.xattrs {
-				sysXattrs(path, &hdr)
+				// Reading extended attributes is best effort
+				// whatever the archiver is set to: it fails on
+				// what the source filesystem holds rather than
+				// on the file, so FAT, exFAT, SMB shares and
+				// tmpfs would each turn archiving into a
+				// failure for carrying no attributes at all.
+				_ = sysXattrs(path, &hdr)
 			}
 			err = a.createSymlink(path, fi, &hdr)
 
 		case hdr.Mode().IsDir():
 			if a.options.xattrs {
-				sysXattrs(path, &hdr)
+				_ = sysXattrs(path, &hdr)
 			}
 			err = a.createDirectory(fi, &hdr)
 
@@ -617,7 +640,7 @@ func (a *Archiver) Archive(ctx context.Context, files map[string]os.FileInfo) (e
 				hdr.UncompressedSize64 = 0
 				hdr.CRC32 = 0
 				if a.options.xattrs {
-					sysXattrs(path, &hdr)
+					_ = sysXattrs(path, &hdr)
 				}
 				err = a.createHardlink(fi, &hdr)
 				break
@@ -631,7 +654,7 @@ func (a *Archiver) Archive(ctx context.Context, files map[string]os.FileInfo) (e
 					hdr.UncompressedSize64 = 0
 					hdr.CRC32 = 0
 					if a.options.xattrs {
-						sysXattrs(path, &hdr)
+						_ = sysXattrs(path, &hdr)
 					}
 					hdr.Extra = appendUnix000dExtra(hdr.Extra, &hdr)
 					err = a.createSpecialFile(fi, &hdr)
@@ -645,7 +668,7 @@ func (a *Archiver) Archive(ctx context.Context, files map[string]os.FileInfo) (e
 						h.UncompressedSize64 = 0
 						h.CRC32 = 0
 						if a.options.xattrs {
-							sysXattrs(p, &h)
+							_ = sysXattrs(p, &h)
 						}
 						h.Extra = appendUnix000dExtra(h.Extra, &h)
 						err := a.createSpecialFile(fInfo, &h)
@@ -660,7 +683,7 @@ func (a *Archiver) Archive(ctx context.Context, files map[string]os.FileInfo) (e
 			}
 
 			if a.options.xattrs {
-				sysXattrs(path, &hdr)
+				_ = sysXattrs(path, &hdr)
 			}
 
 			if hdr.UncompressedSize64 > 0 {
@@ -673,10 +696,12 @@ func (a *Archiver) Archive(ctx context.Context, files map[string]os.FileInfo) (e
 					f = fp.Get()
 				}
 				err = a.createFile(ctx, path, fi, &hdr, f)
-				if fp != nil {
-					fp.Put(f)
-				}
 				incOnSuccess(&a.entries, err)
+				if fp != nil {
+					if perr := fp.Put(f); err == nil {
+						err = perr
+					}
+				}
 			} else {
 				p := path
 				fInfo := fi
@@ -684,9 +709,11 @@ func (a *Archiver) Archive(ctx context.Context, files map[string]os.FileInfo) (e
 				select {
 				case taskCh <- func() error {
 					f := fp.Get()
-					defer fp.Put(f)
 					err := a.createFile(ctx, p, fInfo, &h, f)
 					incOnSuccess(&a.entries, err)
+					if perr := fp.Put(f); err == nil {
+						err = perr
+					}
 					return err
 				}:
 				case <-ctx.Done():
@@ -707,6 +734,7 @@ func (a *Archiver) Archive(ctx context.Context, files map[string]os.FileInfo) (e
 
 func (a *Archiver) fileInfoHeaderFast(name string, fi os.FileInfo, hdr *FileHeader) {
 	hdr.Name = filepath.ToSlash(name)
+	// #nosec G115 -- nothing downstream trusts this number: it picks a compression method and sizes a buffer, and the entry's real size is recomputed from the bytes the writer wrote, so even a FileInfo reporting -1 still produces a correct entry
 	hdr.UncompressedSize64 = uint64(fi.Size())
 	hdr.Modified = fi.ModTime()
 	hdr.SetMode(fi.Mode())
@@ -796,7 +824,9 @@ func (a *Archiver) createFile(ctx context.Context, path string, fi os.FileInfo, 
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	// The file is being read into the archive; nothing is written
+	// through this handle.
+	defer func() { _ = f.Close() }()
 
 	return a.compressFile(ctx, f, fi, hdr, tmp)
 }
@@ -820,6 +850,7 @@ func analyzeBlock(p []byte) (store, huffmanOnly bool) {
 	if unique > 224 {
 		return true, false
 	}
+	// #nosec G115 -- p is the peek buffer, at most 64 KiB, so a quarter of its length fits a uint32 many times over
 	if maxFreq > uint32(len(p)/4) {
 		return false, false
 	}
@@ -833,7 +864,13 @@ func (a *Archiver) compressFile(ctx context.Context, r io.ReadSeeker, fi os.File
 	if !a.options.torrentZip && hdr.UncompressedSize64 >= 4096 && hdr.Method == Deflate {
 		var peekBuf [64 * 1024]byte
 		n, _ := io.ReadFull(r, peekBuf[:])
-		r.Seek(0, io.SeekStart)
+		// The peek has to be given back before the file is compressed:
+		// a rewind that did not happen puts the first 64 KiB of the
+		// file into the archive twice over, under the CRC of a file
+		// that has neither.
+		if _, serr := r.Seek(0, io.SeekStart); serr != nil {
+			return serr
+		}
 		if n > 0 {
 			store, huffmanOnly := analyzeBlock(peekBuf[:n])
 			if store {
@@ -908,7 +945,10 @@ func (a *Archiver) compressFile(ctx context.Context, r io.ReadSeeker, fi os.File
 			wn, werr := fw.Write(copyBuf[:n])
 			atomic.AddInt64(&a.written, int64(wn))
 			if hasher != nil {
-				hasher.Write(copyBuf[:wn])
+				// hash.Hash.Write never returns an error; the
+				// interface carries one only because it is
+				// io.Writer.
+				_, _ = hasher.Write(copyBuf[:wn])
 			}
 			if werr != nil {
 				err = werr
@@ -936,8 +976,14 @@ func (a *Archiver) compressFile(ctx context.Context, r io.ReadSeeker, fi os.File
 	}
 	hdr.CompressedSize64 = tmp.Written()
 	if hdr.CompressedSize64 > hdr.UncompressedSize64+4096 && !a.options.torrentZip {
-		r.Seek(0, io.SeekStart)
+		// The file is about to be read a second time, stored rather
+		// than compressed; without the rewind the entry would hold
+		// whatever is left after the first pass.
+		if _, serr := r.Seek(0, io.SeekStart); serr != nil {
+			return serr
+		}
 		hdr.Method = Store
+		// #nosec G115 -- the size came from the operating system as an int64 and was widened on the way in
 		atomic.AddInt64(&a.written, -int64(hdr.UncompressedSize64))
 		return a.compressFileSimple(ctx, r, fi, hdr)
 	}

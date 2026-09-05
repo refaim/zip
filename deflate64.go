@@ -122,14 +122,18 @@ var (
 func initStaticLiteralTree() *huffmanTree {
 	t := &huffmanTree{}
 	lens := getStaticLiteralTreeLength()
-	t.newInPlace(lens[:])
+	// The static literal tree is built from the code lengths RFC 1951 fixes at
+	// compile time, so newInPlace cannot report a malformed table here.
+	_ = t.newInPlace(lens[:])
 	return t
 }
 
 func initStaticDistanceTree() *huffmanTree {
 	t := &huffmanTree{}
 	lens := getStaticDistanceTreeLength()
-	t.newInPlace(lens[:])
+	// Same as above: the 32 five-bit distance codes are a compile-time
+	// constant, so newInPlace cannot fail.
+	_ = t.newInPlace(lens[:])
 	return t
 }
 
@@ -217,6 +221,9 @@ func (in *inputBuffer) getBits(count int32) (uint16, error) {
 	if !in.ensureBitsAvailable(count) {
 		return 0, errDataNeeded
 	}
+	// #nosec G115 -- count never exceeds 16 (the widest field any caller reads
+	// is the 16 extra bits of Deflate64 length code 285, and the accumulator
+	// only ever loads two bytes ahead), so the masked value fits in uint16.
 	result := uint16(in.bits.bitBuffer & in.getBitMask(count))
 	in.bits.bitBuffer >>= count
 	in.bits.bitsInBuffer -= count
@@ -246,6 +253,8 @@ func (in *inputBuffer) getBitsAssumeInput(count int32) uint32 {
 func (in *inputBuffer) copyTo(output []byte) int {
 	bytesFromBitBuffer := 0
 	for in.bits.bitsInBuffer > 0 && len(output) > 0 {
+		// #nosec G115 -- the bit buffer is drained one byte at a time, so
+		// taking its low 8 bits here is the intended operation.
 		output[0] = byte(in.bits.bitBuffer)
 		output = output[1:]
 		in.bits.bitBuffer >>= 8
@@ -474,6 +483,8 @@ func (ht *huffmanTree) newInPlace(codeLengths []byte) error {
 	for i := range ht.nodes {
 		ht.nodes[i] = 0
 	}
+	// #nosec G115 -- every caller passes one of the fixed Deflate code length
+	// tables, so len(codeLengths) is at most maxCodeLengths (288).
 	ht.codeLengthsLength = uint16(len(codeLengths))
 	copy(ht.codeLengthArray[:], codeLengths)
 	for i := len(codeLengths); i < len(ht.codeLengthArray); i++ {
@@ -590,10 +601,6 @@ func (ht *huffmanTree) getNextSymbolAssumeInput(input *inputBuffer) (uint16, err
 	return symbol, nil
 }
 
-func (ht *huffmanTree) codeLengths() []byte {
-	return ht.codeLengthArray[:ht.codeLengthsLength]
-}
-
 // State machine management and table tables
 type inflaterState int
 
@@ -669,9 +676,10 @@ func (im *inflaterManaged) decode(input *inputBuffer) error {
 	var eob bool
 	var err error
 
-	if im.state == stateDataErrored {
+	switch im.state {
+	case stateDataErrored:
 		return errDataError
-	} else if im.state == stateDone {
+	case stateDone:
 		return nil
 	}
 
@@ -704,17 +712,18 @@ func (im *inflaterManaged) decode(input *inputBuffer) error {
 		}
 	}
 
-	if im.blockType == blockTypeDynamic {
+	switch im.blockType {
+	case blockTypeDynamic:
 		if im.state < stateDecodeTop {
 			err = im.decodeDynamicBlockHeader(input)
 		} else {
 			err = im.decodeBlock(input, &eob)
 		}
-	} else if im.blockType == blockTypeStatic {
+	case blockTypeStatic:
 		err = im.decodeBlock(input, &eob)
-	} else if im.blockType == blockTypeUncompressed {
+	case blockTypeUncompressed:
 		err = im.decodeUncompressedBlock(input, &eob)
-	} else {
+	default:
 		err = errDataError
 	}
 
@@ -742,12 +751,16 @@ func (im *inflaterManaged) decodeUncompressedBlock(input *inputBuffer, endOfBloc
 				return err
 			}
 			idx := im.state - stateUncompressedByte1
+			// #nosec G115 -- getBits(8) returns at most eight bits, so the
+			// value always fits in a byte.
 			im.blockLengthBuffer[idx] = byte(bits)
 			if im.state == stateUncompressedByte4 {
+				// A stored block repeats its length as a one's complement
+				// 16-bit value. Both sides below are assembled from two bytes
+				// each, so comparing them needs no narrowing.
 				im.blockLength = int(im.blockLengthBuffer[0]) + int(im.blockLengthBuffer[1])*256
-				blockLengthComplement := int32(im.blockLengthBuffer[2]) + int32(im.blockLengthBuffer[3])*256
-
-				if uint16(im.blockLength) != uint16(^blockLengthComplement) {
+				blockLengthComplement := int(im.blockLengthBuffer[2]) + int(im.blockLengthBuffer[3])*256
+				if im.blockLength != blockLengthComplement^0xFFFF {
 					return errDataError
 				}
 			}
@@ -937,6 +950,9 @@ func (im *inflaterManaged) decodeBlockFastInnerLoop(input *inputBuffer) (int, bo
 			if distanceCode <= 3 {
 				offset = distanceCode + 1
 			} else {
+				// #nosec G115 -- the distance tree is built from a 32 entry
+				// code length table, so distanceCode is 0..31 and the shift
+				// yields at most 14.
 				extraBits := int32((distanceCode - 2) >> 1)
 				bits := input.getBitsAssumeInput(extraBits)
 				if distanceCode >= len(distanceBasePosition) {
@@ -990,6 +1006,8 @@ loop:
 				if err != nil {
 					return err
 				}
+				// #nosec G115 -- getBits(3) returns at most three bits, so the
+				// code length always fits in a byte.
 				im.codeLengthTreeCodeLength[codeOrder[im.loopCounter]] = byte(bits)
 				im.loopCounter++
 			}
@@ -1022,7 +1040,8 @@ loop:
 					im.loopCounter++
 				} else {
 					var repeatCount uint32
-					if im.lengthCode == 16 {
+					switch im.lengthCode {
+					case 16:
 						im.state = stateReadingTreeCodesAfter
 						if im.loopCounter == 0 {
 							return errDataError
@@ -1044,7 +1063,7 @@ loop:
 							im.codeList[im.loopCounter] = previousCode
 							im.loopCounter++
 						}
-					} else if im.lengthCode == 17 {
+					case 17:
 						im.state = stateReadingTreeCodesAfter
 						bits, err := input.getBits(3)
 						if err != nil {
@@ -1061,7 +1080,7 @@ loop:
 							im.codeList[im.loopCounter] = 0
 							im.loopCounter++
 						}
-					} else {
+					default:
 						im.state = stateReadingTreeCodesAfter
 						bits, err := input.getBits(7)
 						if err != nil {

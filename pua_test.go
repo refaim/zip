@@ -447,7 +447,7 @@ func TestPUA_Zip_HardLinkToUndecodableName(t *testing.T) {
 
 	// One file under two names, whichever spelling the platform gave the
 	// first of them.
-	if err := os.WriteFile(filepath.Join(dstDir, wantOnDisk(rawName)), []byte("rewritten....."), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(dstDir, wantOnDisk(rawName)), []byte("rewritten....."), 0600); err != nil {
 		t.Fatal(err)
 	}
 	data, err := os.ReadFile(filepath.Join(dstDir, "hard.txt"))
@@ -570,7 +570,7 @@ func TestPUA_Zip_IncrementalUndecodableName(t *testing.T) {
 		wantOnDisk(rawKept): "from the earlier run",
 		wantOnDisk(rawGone): "no longer in the archive",
 	} {
-		if err := os.WriteFile(filepath.Join(dstDir, name), []byte(content), 0644); err != nil {
+		if err := os.WriteFile(filepath.Join(dstDir, name), []byte(content), 0600); err != nil {
 			t.Fatal(err)
 		}
 	}

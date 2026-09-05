@@ -63,6 +63,8 @@ func getDistSlot(dist uint32) uint32 {
 		return dist - 1
 	}
 	// Use high-speed CPU leading zeros instruction for log2 without loops
+	// #nosec G115 -- dist is at least 5 here, so LeadingZeros32(dist-1) is at
+	// most 29 and the difference stays between 2 and 31.
 	msb := uint32(31 - bits.LeadingZeros32(dist-1))
 	return (msb << 1) + uint32((dist-1)>>(msb-1)&1)
 }
@@ -176,6 +178,10 @@ func (op *optimalParser) getOptimal() (uint32, uint32) {
 				lenRes, distRes := op.backward(cur)
 				op.nodes[cur&optimalMask].backPrev = op.matches[len(op.matches)-1].distance
 				op.optEnd = cur + newLen
+				// #nosec G115 -- optEnd is a byte offset inside the block
+				// being compressed (a match never reaches past the end of the
+				// data the finder was reset with), and the writer caps blocks
+				// at blockSizeLimit (65532) bytes, so it fits in uint16.
 				op.nodes[cur&optimalMask].posPrev = uint16(op.optEnd)
 				op.mf.skip(newLen - 1)
 				return lenRes, distRes
@@ -246,6 +252,9 @@ func (op *optimalParser) backward(cur uint32) (uint32, uint32) {
 		posMem = uint32(op.nodes[posPrev&optimalMask].posPrev)
 
 		op.nodes[posPrev&optimalMask].backPrev = backCur
+		// #nosec G115 -- cur walks positions inside the decision buffer, which
+		// the parser never lets past optimalBufSize-maxMatchLength32 (3838),
+		// so it fits in uint16.
 		op.nodes[posPrev&optimalMask].posPrev = uint16(cur)
 
 		cur = posPrev

@@ -131,7 +131,10 @@ func OpenMultiVolume(mainPath string, flag int) (*MultiVolumeReader, int64, erro
 				break
 			}
 			for _, openedFile := range files {
-				openedFile.Close()
+				// The volumes opened so far are being given up
+				// because one of them could not be opened; that
+				// is the error the caller gets.
+				_ = openedFile.Close()
 			}
 			return nil, 0, err
 		}
@@ -144,7 +147,9 @@ func OpenMultiVolume(mainPath string, flag int) (*MultiVolumeReader, int64, erro
 	fMain, err := os.OpenFile(mainPath, flag, 0644)
 	if err != nil {
 		for _, f := range files {
-			f.Close()
+			// The volumes opened so far are being given up
+			// because the main one could not be opened.
+			_ = f.Close()
 		}
 		return nil, 0, err
 	}
@@ -245,7 +250,10 @@ func (m *MultiVolumeWriter) Close() error {
 	prefix := m.mainPath[:len(m.mainPath)-len(ext)]
 	lastVolPath := fmt.Sprintf("%s.z%02d", prefix, m.volumeIndex)
 
-	os.Remove(m.mainPath)
+	// Making room for the rename below, which is what actually has to
+	// succeed: on Windows it will not replace a name that is still there,
+	// and it reports that itself.
+	_ = os.Remove(m.mainPath)
 	if err := os.Rename(lastVolPath, m.mainPath); err != nil {
 		return err
 	}

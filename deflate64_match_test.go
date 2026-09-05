@@ -2,6 +2,7 @@ package zip
 
 import (
 	"bytes"
+	"io"
 	"testing"
 )
 
@@ -105,6 +106,10 @@ func TestOptimalParser_Basic(t *testing.T) {
 	// A greedy algorithm would choose "ab" at pos 2, losing "abcd" later.
 	// The optimal parser must construct a more efficient chain.
 	data := []byte("ababcabcd")
+	const dataLen = 9
+	if len(data) != dataLen {
+		t.Fatalf("test data is %d bytes, the walk below assumes %d", len(data), dataLen)
+	}
 
 	mf := newMatchFinder(true, 32)
 	mf.reset(data)
@@ -124,10 +129,28 @@ func TestOptimalParser_Basic(t *testing.T) {
 		t.Errorf("Expected literal, got len=%d, dist=%d", length, distance)
 	}
 
-	// Next, the parser should efficiently match "abc" and "abcd"
-	length, distance = parser.getOptimal()
-	if length == 0 {
-		t.Fatal("Parser stalled")
+	// The rest of the input has to be covered exactly, and the second "abc"
+	// has to come back as a backreference instead of three more literals.
+	consumed := uint32(2)
+	matched := false
+	for consumed < dataLen {
+		length, distance = parser.getOptimal()
+		if length == 0 {
+			t.Fatal("Parser stalled")
+		}
+		if distance != 0 {
+			matched = true
+			if distance != 3 || length != 3 {
+				t.Errorf("Expected the repeated \"abc\" at distance 3 length 3, got len=%d dist=%d", length, distance)
+			}
+		}
+		consumed += length
+	}
+	if consumed != dataLen {
+		t.Errorf("Parser covered %d bytes, want %d", consumed, dataLen)
+	}
+	if !matched {
+		t.Error("Parser emitted only literals and missed the repeated \"abc\"")
 	}
 }
 
@@ -170,5 +193,70 @@ func TestGetLenSlot(t *testing.T) {
 		if got := getLenSlot(tc.length); got != tc.want {
 			t.Errorf("getLenSlot(%d) = %d, want %d", tc.length, got, tc.want)
 		}
+	}
+}
+
+// TestOptimalParser_LongMatchInsideLookahead drives the parser into the branch
+// where the lookahead it runs inside its decision graph hits a match long
+// enough to abandon the graph: the position under test starts a three byte
+// match, and one byte further on a match longer than niceMatch begins.
+func TestOptimalParser_LongMatchInsideLookahead(t *testing.T) {
+	run := bytes.Repeat([]byte{'z'}, 300)
+
+	var src []byte
+	src = append(src, 'X', 'b', 'c')      // "bc" plus the run: the long match
+	src = append(src, run...)             //
+	src = append(src, 'Y')                //
+	src = append(src, 'a', 'b', 'c', 'W') // an "abc" that diverges after three bytes
+	src = append(src, 'a', 'b', 'c')      // the position the parser starts from
+	src = append(src, run...)             //
+
+	const (
+		srcLen       = 611 // 3 + 300 + 1 + 4 + 3 + 300
+		wantLength   = 302 // "bc" plus the 300 byte run
+		wantDistance = 308
+	)
+	if len(src) != srcLen {
+		t.Fatalf("test data is %d bytes, the walk below assumes %d", len(src), srcLen)
+	}
+
+	mf := newMatchFinder(true, 64)
+	mf.reset(src)
+	parser := newOptimalParser(mf)
+
+	consumed := uint32(0)
+	found := false
+	for consumed < srcLen {
+		length, distance := parser.getOptimal()
+		if length == 0 {
+			t.Fatal("Parser stalled")
+		}
+		if length == wantLength && distance == wantDistance {
+			found = true
+		}
+		consumed += length
+	}
+	if consumed != srcLen {
+		t.Errorf("Parser covered %d bytes, want %d", consumed, srcLen)
+	}
+	if !found {
+		t.Errorf("Parser never emitted the %d byte match at distance %d", wantLength, wantDistance)
+	}
+
+	// The tokens that branch produces still have to add up to the input.
+	buf := new(bytes.Buffer)
+	encoder := newDeflate64Writer(buf)
+	mustWrite(t, encoder, src)
+	if err := encoder.Close(); err != nil {
+		t.Fatalf("Encoder close failed: %v", err)
+	}
+	decoder := decodeDeflate64(buf)
+	closeAt(t, decoder)
+	decompressed, err := io.ReadAll(decoder)
+	if err != nil {
+		t.Fatalf("Decompression failed: %v", err)
+	}
+	if !bytes.Equal(decompressed, src) {
+		t.Error("Decompressed data does not match the original")
 	}
 }

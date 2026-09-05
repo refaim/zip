@@ -32,7 +32,7 @@ func TestCreateWindowsSymlink_FallbacksUseTheAnchoredTarget(t *testing.T) {
 
 	// The spelling the archive used, and what it would name from anywhere
 	// else. Neither the hard link nor the copy may go looking for this one.
-	if err := os.WriteFile(filepath.Join(tmp, "data.txt"), []byte("WRONG"), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(tmp, "data.txt"), []byte("WRONG"), 0600); err != nil {
 		t.Fatal(err)
 	}
 	tree := filepath.Join(tmp, "tree")
@@ -40,12 +40,12 @@ func TestCreateWindowsSymlink_FallbacksUseTheAnchoredTarget(t *testing.T) {
 		t.Fatal(err)
 	}
 	resolved := filepath.Join(tree, "data.txt")
-	if err := os.WriteFile(resolved, []byte("RIGHT"), 0644); err != nil {
+	if err := os.WriteFile(resolved, []byte("RIGHT"), 0600); err != nil {
 		t.Fatal(err)
 	}
 
 	link := filepath.Join(tree, "link")
-	if err := os.WriteFile(link, []byte("stale"), 0644); err != nil {
+	if err := os.WriteFile(link, []byte("stale"), 0600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -114,7 +114,7 @@ func TestCreateWindowsSymlink_MakesARealSymlink(t *testing.T) {
 			}
 			resolved := filepath.Join(tmp, "data.txt")
 			if tt.present {
-				if err := os.WriteFile(resolved, []byte("payload"), 0644); err != nil {
+				if err := os.WriteFile(resolved, []byte("payload"), 0600); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -171,7 +171,7 @@ func TestCreateWindowsSymlink_LadderRungs(t *testing.T) {
 			t.Fatal(err)
 		}
 		resolved := filepath.Join(tmp, "data.txt")
-		if err := os.WriteFile(resolved, []byte("payload"), 0644); err != nil {
+		if err := os.WriteFile(resolved, []byte("payload"), 0600); err != nil {
 			t.Fatal(err)
 		}
 
@@ -187,7 +187,7 @@ func TestCreateWindowsSymlink_LadderRungs(t *testing.T) {
 			t.Errorf("%s is a symlink, want the hard link the machine can make", link)
 		}
 		// One file under two names: a write through one is a write to both.
-		if err := os.WriteFile(resolved, []byte("rewritten"), 0644); err != nil {
+		if err := os.WriteFile(resolved, []byte("rewritten"), 0600); err != nil {
 			t.Fatal(err)
 		}
 		data, err := os.ReadFile(link)
@@ -217,7 +217,7 @@ func TestCreateWindowsSymlink_LadderRungs(t *testing.T) {
 			t.Fatal(err)
 		}
 		resolved := filepath.Join(tmp, "data.txt")
-		if err := os.WriteFile(resolved, []byte("payload"), 0644); err != nil {
+		if err := os.WriteFile(resolved, []byte("payload"), 0600); err != nil {
 			t.Fatal(err)
 		}
 
@@ -243,7 +243,7 @@ func TestCreateWindowsSymlink_LadderRungs(t *testing.T) {
 			t.Errorf("the copy carries %q, want %q", data, "payload")
 		}
 		// A copy is its own file, so a write to the source does not reach it.
-		if err := os.WriteFile(resolved, []byte("rewritten"), 0644); err != nil {
+		if err := os.WriteFile(resolved, []byte("rewritten"), 0600); err != nil {
 			t.Fatal(err)
 		}
 		if data, err := os.ReadFile(link); err != nil || string(data) != "payload" {
@@ -370,7 +370,7 @@ func TestCreateWindowsSymlink_CopyRungIsBudgeted(t *testing.T) {
 		t.Fatal(err)
 	}
 	resolved := filepath.Join(tmp, "data.txt")
-	if err := os.WriteFile(resolved, bytes.Repeat([]byte("x"), 4096), 0644); err != nil {
+	if err := os.WriteFile(resolved, bytes.Repeat([]byte("x"), 4096), 0600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -397,7 +397,7 @@ func TestCreateWindowsSymlink_CopyRungIsBudgeted(t *testing.T) {
 func TestCopyFileContents(t *testing.T) {
 	tmp := t.TempDir()
 	src := filepath.Join(tmp, "src.txt")
-	if err := os.WriteFile(src, []byte("payload"), 0644); err != nil {
+	if err := os.WriteFile(src, []byte("payload"), 0600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -448,4 +448,108 @@ func TestRemoveHeldElsewhere(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestGetAlternativeDataStreams_NoHandle covers the two things
+// FindFirstStreamW means by INVALID_HANDLE_VALUE, which the handle alone
+// cannot tell apart.
+//
+// The errno decides, and it is worth reading only once the handle has been
+// found invalid: the call hands one back whatever happened. ERROR_HANDLE_EOF
+// is a path with no streams to list, which is an answer rather than a failure.
+// Anything else is a path that could not be read at all, and an empty list
+// there would be indistinguishable from a file that carries no extra streams.
+func TestGetAlternativeDataStreams_NoHandle(t *testing.T) {
+	tmp := t.TempDir()
+
+	t.Run("a directory has nothing to enumerate", func(t *testing.T) {
+		dir := filepath.Join(tmp, "sub")
+		mustMkdirAll(t, dir)
+
+		streams, err := getAlternativeDataStreams(dir)
+		if err != nil {
+			t.Fatalf("getAlternativeDataStreams(%s): %v", dir, err)
+		}
+		if len(streams) != 0 {
+			t.Errorf("streams = %v, want none", streams)
+		}
+	})
+
+	t.Run("a path that cannot be read is reported", func(t *testing.T) {
+		missing := filepath.Join(tmp, "no_such_file.txt")
+
+		streams, err := getAlternativeDataStreams(missing)
+		if err == nil {
+			t.Fatalf("streams = %v and no error for a file that is not there", streams)
+		}
+		if !errors.Is(err, windows.ERROR_FILE_NOT_FOUND) {
+			t.Errorf("err = %v, want ERROR_FILE_NOT_FOUND", err)
+		}
+		if streams != nil {
+			t.Errorf("streams = %v, want none", streams)
+		}
+	})
+
+	t.Run("a path that cannot be handed to Windows at all", func(t *testing.T) {
+		// A wide string ends at its first NUL, so a name that contains
+		// one cannot be passed to any Win32 call: it would arrive cut
+		// short and the answer would be about a different file.
+		streams, err := getAlternativeDataStreams(filepath.Join(tmp, "na\x00me"))
+		if err == nil {
+			t.Fatalf("streams = %v and no error for a name with a NUL in it", streams)
+		}
+		if streams != nil {
+			t.Errorf("streams = %v, want none", streams)
+		}
+	})
+}
+
+// TestPreallocate covers the room the extractor makes for a file whose size
+// the archive already declared.
+//
+// It is two calls on Windows: a hint to NTFS to keep the clusters together,
+// which the file system is free to refuse and which changes nothing about the
+// file if it does, and the logical end of file, which is what the caller is
+// actually told about and is what is checked here.
+func TestPreallocate(t *testing.T) {
+	tmp := t.TempDir()
+
+	t.Run("a file worth reserving gets its size up front", func(t *testing.T) {
+		f, err := os.Create(filepath.Join(tmp, "big.bin"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		closeAt(t, f)
+
+		const size = 2 * 1024 * 1024
+		if err := preallocate(f, size); err != nil {
+			t.Fatalf("preallocate: %v", err)
+		}
+		fi, err := f.Stat()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if fi.Size() != size {
+			t.Errorf("the file is %d bytes, want the %d that were reserved", fi.Size(), size)
+		}
+	})
+
+	t.Run("a file too small to be worth it is left alone", func(t *testing.T) {
+		f, err := os.Create(filepath.Join(tmp, "small.bin"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		closeAt(t, f)
+
+		if err := preallocate(f, 1024*1024); err != nil {
+			t.Fatalf("preallocate: %v", err)
+		}
+		fi, err := f.Stat()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if fi.Size() != 0 {
+			t.Errorf("the file grew to %d bytes for a reservation not worth making", fi.Size())
+		}
+	})
 }

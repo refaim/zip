@@ -355,16 +355,17 @@ func TestSolidSeekIndex_RandomAccess(t *testing.T) {
 		buf := new(bytes.Buffer)
 		zw := NewWriter(buf)
 
+		payload := fullData.Bytes()
 		fh := &FileHeader{
 			Name:               "seekable.bin",
 			Method:             Deflate,
 			SeekChunkSize:      chunkSize,
 			SeekContinuous:     continuous,
-			UncompressedSize64: uint64(fullData.Len()),
+			UncompressedSize64: uint64(len(payload)),
 		}
 
 		w := mustCreateHeader(t, zw, fh)
-		mustWrite(t, w, fullData.Bytes())
+		mustWrite(t, w, payload)
 		if err := zw.Close(); err != nil {
 			t.Fatalf("failed to close writer: %v", err)
 		}
@@ -444,9 +445,14 @@ func TestPPMd_HeaderParsing(t *testing.T) {
 	// newPPMdReader will attempt to initialize the library.
 	// Verify that there is no panic when reading properties.
 	rc := newPPMdReader(r, 1000)
-	if rc != nil {
-		// Wait for error or empty result as there is no data after the header
+	// A nil reader is how newPPMdReader reports that it could not read the
+	// two property bytes. They are both there, so whatever it makes of them
+	// -- a decoder, or an errorReader saying why not -- it has to hand one
+	// back rather than treat the header as truncated.
+	if rc == nil {
+		t.Fatal("newPPMdReader returned nil for a header it read in full")
 	}
+	closeAt(t, rc)
 }
 func TestPPMd_MemoryLimit(t *testing.T) {
 	// MemSize is bits 4-11 (+1) in MB.
@@ -463,8 +469,9 @@ func TestPPMd_MemoryLimit(t *testing.T) {
 	// A build with no PPMd at all refuses the header outright, which is the
 	// same answer to the same question: the memory it asks for is not
 	// granted.
-	if err == nil || !(strings.Contains(err.Error(), "PPMd memory limit exceeded") ||
-		strings.Contains(err.Error(), "PPMd compression is not supported")) {
+	if err == nil ||
+		(!strings.Contains(err.Error(), "PPMd memory limit exceeded") &&
+			!strings.Contains(err.Error(), "PPMd compression is not supported")) {
 		t.Errorf("expected the PPMd memory request to be refused, got: %v", err)
 	}
 }

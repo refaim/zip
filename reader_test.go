@@ -12,6 +12,22 @@ import (
 	"testing"
 )
 
+// cutLast shortens the file at path by n bytes, which is how these tests take
+// the central directory off an archive they have just written.
+func cutLast(t *testing.T, path string, n int64) {
+	t.Helper()
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat %s: %v", path, err)
+	}
+	if fi.Size() < n {
+		t.Fatalf("%s is %d bytes, too short to lose %d", path, fi.Size(), n)
+	}
+	if err := os.Truncate(path, fi.Size()-n); err != nil {
+		t.Fatalf("truncate %s: %v", path, err)
+	}
+}
+
 func TestReader_DataDescriptorNoSignature(t *testing.T) {
 	// Manually create an archive with the 0x8 flag (Data Descriptor), but without the descriptor signature
 	buf := new(bytes.Buffer)
@@ -119,10 +135,8 @@ func TestSalvageMode_ZIP64(t *testing.T) {
 		t.Fatalf("close %s: %v", zipPath, err)
 	}
 
-	// Truncate the Central Directory
-	content, _ := os.ReadFile(zipPath)
-	truncatedContent := content[:len(content)-100]
-	mustWriteFile(t, zipPath, truncatedContent, 0644)
+	// Truncate the Central Directory: cut the last 100 bytes off the file.
+	cutLast(t, zipPath, 100)
 
 	// Salvage mode should parse the ZIP64 extra field and recover sizes
 	zr, err := OpenReader(zipPath)
@@ -558,10 +572,8 @@ func TestSalvageMode_Zip(t *testing.T) {
 
 	// 2. Determine Central Directory offset (it is at the end)
 	// and truncate the file, completely removing the "table of contents".
-	content, _ := os.ReadFile(zipPath)
 	// EOCD signature: 0x06054b50. Just cut off the last 100 bytes to be sure.
-	truncatedContent := content[:len(content)-100]
-	mustWriteFile(t, zipPath, truncatedContent, 0644)
+	cutLast(t, zipPath, 100)
 
 	// 3. NewReader should drop into Salvage Mode and still find the files
 	zr, err := OpenReader(zipPath)
@@ -625,7 +637,7 @@ func TestReadCloser_CloseReleasesFileHandles(t *testing.T) {
 	footer := make([]byte, 32)
 	binary.LittleEndian.PutUint64(footer[8:16], uint64(len(archive)))
 	copy(footer[16:32], magicF4Recovery)
-	if err := os.WriteFile(zipPath, append(archive, footer...), 0644); err != nil {
+	if err := os.WriteFile(zipPath, append(archive, footer...), 0600); err != nil {
 		t.Fatal(err)
 	}
 

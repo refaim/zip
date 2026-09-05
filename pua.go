@@ -30,6 +30,15 @@ func encodeMappedString(s string) []byte {
 	if len(runes) > 0 && runes[0] == MappedStringMark {
 		b := make([]byte, len(runes)-1)
 		for i, r := range runes[1:] {
+			// The mark says the rest is one private-use rune per byte,
+			// but the string may have been edited since it was mapped.
+			// A rune outside the 256 the mapping uses stands for no
+			// byte, and narrowing it anyway would put a byte of its low
+			// bits into the name, so the string is taken at face value
+			// instead.
+			if r < privateUseBase || r > privateUseBase+0xFF {
+				return []byte(s)
+			}
 			b[i] = byte(r - privateUseBase)
 		}
 		return b

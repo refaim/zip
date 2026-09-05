@@ -1,8 +1,9 @@
 package zip
 
 import (
-	"bytes"
+	"encoding/binary"
 	"strings"
+	"unicode/utf16"
 )
 
 func sanitizeZoneIdentifier(data []byte) []byte {
@@ -62,12 +63,15 @@ func decodeUTF16LE(data []byte) string {
 }
 
 func encodeUTF16LE(s string) []byte {
-	var buf bytes.Buffer
-	buf.WriteByte(0xFF)
-	buf.WriteByte(0xFE)
-	for _, r := range s {
-		buf.WriteByte(byte(r))
-		buf.WriteByte(byte(r >> 8))
+	// utf16.Encode splits what does not fit in one code unit into a surrogate
+	// pair, so every unit written here is the whole of what it stands for;
+	// spelling the units out a byte at a time used to keep the low sixteen
+	// bits of the rune and drop the rest.
+	units := utf16.Encode([]rune(s))
+	buf := make([]byte, 0, 2+2*len(units))
+	buf = append(buf, 0xFF, 0xFE)
+	for _, u := range units {
+		buf = binary.LittleEndian.AppendUint16(buf, u)
 	}
-	return buf.Bytes()
+	return buf
 }

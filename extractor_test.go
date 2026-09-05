@@ -530,30 +530,23 @@ func TestExtractor_KeepBroken(t *testing.T) {
 	zipPath := filepath.Join(tmp, "broken.zip")
 	dstDir := filepath.Join(tmp, "extract")
 
-	f, err := os.Create(zipPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	closeAt(t, f)
-	zw := NewWriter(f)
+	// The archive is assembled in memory so that the corruption below is
+	// applied to the bytes on their way to disk, rather than by writing the
+	// file once and reading it back to patch it.
+	var archive bytes.Buffer
+	zw := NewWriter(&archive)
 	w := mustCreate(t, zw, "file.txt")
 	mustWrite(t, w, []byte("some substantial data to corrupt"))
 	if err := zw.Close(); err != nil {
 		t.Fatalf("close writer: %v", err)
 	}
-	if err := f.Close(); err != nil {
-		t.Fatalf("close %s: %v", zipPath, err)
-	}
 
 	// Corrupt the zip to force a CRC or read error during extraction
-	raw, err := os.ReadFile(zipPath)
-	if err != nil {
-		t.Fatal(err)
-	}
+	raw := archive.Bytes()
 	for i := 30; i < 40 && i < len(raw); i++ {
 		raw[i] = 0x00
 	}
-	mustWriteFile(t, zipPath, raw, 0644)
+	mustWriteFile(t, zipPath, raw, 0600)
 
 	// 1. Extraction without KeepBroken (default): file should be cleaned up (deleted)
 	e, err := NewExtractor(zipPath, dstDir)
@@ -986,12 +979,11 @@ func TestSolid_CRC32Check(t *testing.T) {
 	zipPath := filepath.Join(tmpDir, "solid_crc.zip")
 	dstDir := filepath.Join(tmpDir, "dst")
 
-	f, err := os.Create(zipPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	closeAt(t, f)
-	zw := NewWriter(f)
+	// The archive is assembled in memory so that the corruption below is
+	// applied to the bytes on their way to disk, rather than by writing the
+	// file once and reading it back to patch it.
+	var archive bytes.Buffer
+	zw := NewWriter(&archive)
 	hdr := &FileHeader{
 		Name:   "Solid.zip",
 		Method: Store,
@@ -1016,21 +1008,15 @@ func TestSolid_CRC32Check(t *testing.T) {
 	if err := zw.Close(); err != nil {
 		t.Fatalf("close writer: %v", err)
 	}
-	if err := f.Close(); err != nil {
-		t.Fatalf("close %s: %v", zipPath, err)
-	}
 
 	// Corrupt the data in the inner file to trigger CRC mismatch
-	raw, err := os.ReadFile(zipPath)
-	if err != nil {
-		t.Fatal(err)
-	}
+	raw := archive.Bytes()
 	// Search for "data to be"
 	idx := bytes.Index(raw, []byte("data to be"))
 	if idx != -1 {
 		raw[idx] = 'D'
 	}
-	mustWriteFile(t, zipPath, raw, 0644)
+	mustWriteFile(t, zipPath, raw, 0600)
 
 	e, err := NewExtractor(zipPath, dstDir)
 	if err != nil {
@@ -1254,12 +1240,11 @@ func TestTolerantMode_Zip(t *testing.T) {
 	zipPath := filepath.Join(tmpDir, "corrupt.zip")
 	dstDir := filepath.Join(tmpDir, "dst")
 
-	f, err := os.Create(zipPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	closeAt(t, f)
-	zw := NewWriter(f)
+	// The archive is assembled in memory so that the corruption below is
+	// applied to the bytes on their way to disk, rather than by writing the
+	// file once and reading it back to patch it.
+	var archive bytes.Buffer
+	zw := NewWriter(&archive)
 	w := mustCreate(t, zw, "good1.txt")
 	mustWrite(t, w, []byte("I am fine"))
 	w = mustCreate(t, zw, "bad.txt")
@@ -1269,20 +1254,17 @@ func TestTolerantMode_Zip(t *testing.T) {
 	if err := zw.Close(); err != nil {
 		t.Fatalf("close writer: %v", err)
 	}
-	if err := f.Close(); err != nil {
-		t.Fatalf("close %s: %v", zipPath, err)
-	}
 
 	// Corrupt bad.txt data (find it in the middle of the archive)
-	raw, err := os.ReadFile(zipPath)
-	if err != nil {
-		t.Fatal(err)
-	}
+	raw := archive.Bytes()
 	idx := bytes.Index(raw, []byte("I will be corrupted"))
+	if idx < 0 {
+		t.Fatal("the archive does not carry the entry the test corrupts")
+	}
 	for i := 0; i < 5; i++ {
 		raw[idx+i] = 0xFF
 	}
-	mustWriteFile(t, zipPath, raw, 0644)
+	mustWriteFile(t, zipPath, raw, 0600)
 
 	// Extract with TolerantMode(true)
 	e, err := NewExtractor(zipPath, dstDir, WithExtractorTolerant(true))
@@ -1652,7 +1634,7 @@ func TestExtractor_HardLink(t *testing.T) {
 	// A hard link is one file under two names, so a write through one name is
 	// visible through the other. That holds on every filesystem this runs on
 	// and needs no platform-specific stat fields to check.
-	if err := os.WriteFile(filepath.Join(dstDir, "target.txt"), []byte("rewritten....."), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(dstDir, "target.txt"), []byte("rewritten....."), 0600); err != nil {
 		t.Fatal(err)
 	}
 	data, err := os.ReadFile(filepath.Join(dstDir, "hard.txt"))
@@ -1683,7 +1665,7 @@ func TestExtractor_RelativeSymlinkTargetResolvesAgainstTheLink(t *testing.T) {
 
 	// "../data.txt" names this one from the working directory, and the one
 	// inside the destination from the link. Only the second is the archive's.
-	if err := os.WriteFile(filepath.Join(tmp, "data.txt"), []byte("WRONG"), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(tmp, "data.txt"), []byte("WRONG"), 0600); err != nil {
 		t.Fatal(err)
 	}
 	cwd := filepath.Join(tmp, "cwd")
@@ -1793,7 +1775,7 @@ func TestExtractor_HardLinkTargetRejected(t *testing.T) {
 			if err := os.MkdirAll(dstDir, 0755); err != nil {
 				t.Fatal(err)
 			}
-			if err := os.WriteFile(filepath.Join(tmp, "outside_secret.txt"), []byte("secret"), 0644); err != nil {
+			if err := os.WriteFile(filepath.Join(tmp, "outside_secret.txt"), []byte("secret"), 0600); err != nil {
 				t.Fatal(err)
 			}
 
@@ -2104,9 +2086,13 @@ func TestExtractor_SymlinkBodyUnreadable(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
+				size, err := u64toi64(zr.File[0].CompressedSize64)
+				if err != nil {
+					t.Fatal(err)
+				}
 				// 0xFF opens a block whose type is the one flate has no
 				// meaning for, so the very first read fails.
-				for i := off; i < off+int64(zr.File[0].CompressedSize64); i++ {
+				for i := off; i < off+size; i++ {
 					raw[i] = 0xFF
 				}
 				return raw
@@ -2118,7 +2104,7 @@ func TestExtractor_SymlinkBodyUnreadable(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			tmp := t.TempDir()
 			zipPath := filepath.Join(tmp, "broken.zip")
-			if err := os.WriteFile(zipPath, tt.archive(t), 0644); err != nil {
+			if err := os.WriteFile(zipPath, tt.archive(t), 0600); err != nil {
 				t.Fatal(err)
 			}
 
@@ -2188,7 +2174,7 @@ func TestExtractor_IncrementalSweepPastAStaleDirectory(t *testing.T) {
 		"a_stale_dir/child.txt": "stale",
 		"z_stale_file.txt":      "stale",
 	} {
-		if err := os.WriteFile(filepath.Join(dstDir, filepath.FromSlash(name)), []byte(content), 0644); err != nil {
+		if err := os.WriteFile(filepath.Join(dstDir, filepath.FromSlash(name)), []byte(content), 0600); err != nil {
 			t.Fatal(err)
 		}
 	}

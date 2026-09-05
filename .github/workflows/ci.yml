@@ -125,6 +125,47 @@ jobs:
             exit 1
           fi
 
+  lint:
+    name: Lint (${{ matrix.goos }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # A linter only ever sees the files the build constraints select, so
+        # one cell reports on one platform's code and says nothing at all
+        # about the others. linux and windows are here because that is where
+        # fs_linux.go, sys_linux.go, fs_windows.go and sys_windows.go live,
+        # and darwin because sys_darwin.go and its half of sys_unix.go are
+        # compiled by neither of the other two.
+        #
+        # freebsd is deliberately absent. Its own file would be analysed here
+        # readily enough, but nothing in this workflow runs on FreeBSD, so a
+        # line changed there could never be shown to be covered by a test --
+        # and the rule this repository holds itself to is that a touched line
+        # is a tested line. Its three findings are therefore left standing and
+        # written down rather than silenced; adding a FreeBSD runner is what
+        # would let them be closed honestly.
+        goos: [linux, windows, darwin]
+    env:
+      CGO_ENABLED: 0
+      # Named at the job rather than passed as an argument: the action runs
+      # the linter itself, and the linter reads the environment.
+      GOOS: ${{ matrix.goos }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+
+      # No args: the configuration is .golangci.yml, whole-tree and identical
+      # to the one every other repository here uses, and the backlog it
+      # reports is zero. There is nothing to narrow the run down to.
+      - uses: golangci/golangci-lint-action@v9.3.0
+        with:
+          version: v2.13.1
+
   vulnerabilities:
     name: Vulnerabilities
     runs-on: ubuntu-latest

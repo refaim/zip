@@ -9,11 +9,18 @@ const (
 	blockSizeLimit = 65532 // Keep safety margin under 64KB limit
 )
 
-// bitWriter implements high-performance LSB-first bit writing
+// bitWriter implements high-performance LSB-first bit writing.
+//
+// Bits are emitted from the middle of the encoder, where returning an error on
+// every call would drown the block layout in plumbing, so the first write
+// error is latched in err instead. Once it is set the stream is corrupt, so
+// both exits report it: flushBlock to the caller of Write, flushBits to the
+// caller of Close.
 type bitWriter struct {
 	w     *bufio.Writer
 	accum uint64
 	nbits uint32
+	err   error
 }
 
 func newBitWriter(w io.Writer) *bitWriter {
@@ -22,23 +29,37 @@ func newBitWriter(w io.Writer) *bitWriter {
 	}
 }
 
+// setErr latches the first error seen while emitting the stream.
+func (bw *bitWriter) setErr(err error) {
+	if err != nil && bw.err == nil {
+		bw.err = err
+	}
+}
+
 func (bw *bitWriter) writeBits(value uint32, bits uint32) {
 	bw.accum |= uint64(value) << bw.nbits
 	bw.nbits += bits
 	for bw.nbits >= 8 {
-		bw.w.WriteByte(byte(bw.accum))
+		// #nosec G115 -- the accumulator is drained one byte at a time, so
+		// emitting its low 8 bits is the operation itself, not a narrowing.
+		bw.setErr(bw.w.WriteByte(byte(bw.accum)))
 		bw.accum >>= 8
 		bw.nbits -= 8
 	}
 }
 
+// flushBits emits the trailing partial byte, flushes the buffer and returns
+// the first error the stream has seen.
 func (bw *bitWriter) flushBits() error {
 	if bw.nbits > 0 {
-		bw.w.WriteByte(byte(bw.accum))
+		// #nosec G115 -- same as in writeBits: the trailing partial byte is
+		// the low 8 bits of the accumulator.
+		bw.setErr(bw.w.WriteByte(byte(bw.accum)))
 		bw.accum = 0
 		bw.nbits = 0
 	}
-	return bw.w.Flush()
+	bw.setErr(bw.w.Flush())
+	return bw.err
 }
 
 // deflate64Writer encodes an incoming data stream into Deflate64 format.
@@ -134,7 +155,10 @@ func (dw *deflate64Writer) flushBlock(bfinal bool) error {
 	// Logical cursor for token assembly.
 	// Physical cursor dw.mf.pos is managed solely by the parser.
 	logicalPos := uint32(0)
-	for logicalPos < uint32(len(dw.dataBuf)) {
+	// #nosec G115 -- Write caps dataBuf at blockSizeLimit (65532) bytes, so
+	// its length always fits in uint32.
+	bufLen := uint32(len(dw.dataBuf))
+	for logicalPos < bufLen {
 		length, distance := dw.parser.getOptimal()
 		if distance == 0 {
 			lit := dw.dataBuf[logicalPos]
@@ -267,9 +291,10 @@ func (dw *deflate64Writer) flushBlock(bfinal bool) error {
 		if c >= 16 {
 			extra := clCodes[i]
 			extraBits := uint32(2)
-			if c == 17 {
+			switch c {
+			case 17:
 				extraBits = 3
-			} else if c == 18 {
+			case 18:
 				extraBits = 7
 			}
 			dw.w.writeBits(uint32(extra), extraBits)
@@ -303,5 +328,7 @@ func (dw *deflate64Writer) flushBlock(bfinal bool) error {
 	dw.w.writeBits(litCodesMap[endOfBlockCode], uint32(litLengths[endOfBlockCode]))
 
 	dw.dataBuf = dw.dataBuf[:0] // Reset buffer
-	return nil
+	// The bit writer latches the first write error instead of reporting it on
+	// every bit, so hand it to the caller here.
+	return dw.w.err
 }

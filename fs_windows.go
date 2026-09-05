@@ -116,24 +116,41 @@ func createWindowsSymlink(target, resolved, link string, isDir bool, eb *entryBu
 	return nil
 }
 
-func copyFileContents(src, dst string, eb *entryBudget) error {
+// copyFileContents copies src to dst, counting the bytes against eb.
+//
+// The destination is closed before this returns and the close is part of the
+// answer: the tail of a copy sits in the operating system's buffers until the
+// handle is let go of, so a close that fails is a file short by whatever was
+// still in flight, and reporting success there would hand back a truncated
+// file as if it were the target the archive named.
+func copyFileContents(src, dst string, eb *entryBudget) (err error) {
 	in, err := os.Open(fixOSPath(src))
 	if err != nil {
 		return err
 	}
-	defer in.Close()
+	// Nothing was written through in, so closing it can only repeat what
+	// the reads already reported.
+	defer func() { _ = in.Close() }()
+
 	out, err := os.Create(fixOSPath(dst))
 	if err != nil {
 		return err
 	}
-	defer out.Close()
+	// A copy that stops part way leaves a truncated regular file where the
+	// archive asked for a link, and nothing about it says it is not the
+	// target. It is taken away again rather than left to be read as one.
+	// Deferred calls run in reverse, so this runs after the close below,
+	// because Windows does not unlink a file that is still open. The error
+	// that caused the removal is the one worth reporting, so a removal that
+	// fails does not replace it.
+	defer func() {
+		if err != nil {
+			_ = os.Remove(fixOSPath(dst))
+		}
+	}()
+	defer dclose(out, &err)
+
 	if _, err = io.CopyBuffer(eb.file(out), in, make([]byte, 1024*1024)); err != nil {
-		// A copy that stops part way leaves a truncated regular file
-		// where the archive asked for a link, and nothing about it says
-		// it is not the target. It is taken away again rather than left
-		// to be read as one.
-		out.Close()
-		os.Remove(fixOSPath(dst))
 		return err
 	}
 	return out.Sync()
@@ -228,20 +245,37 @@ func getAlternativeDataStreams(path string) ([]string, error) {
 		uintptr(unsafe.Pointer(&data)),
 		0,
 	)
+	// LazyProc.Call always hands back a syscall.Errno, zero when the call
+	// succeeded, so err says nothing until the handle it came with has been
+	// looked at. FindFirstStreamW answers INVALID_HANDLE_VALUE both for a
+	// path it could not open and for one that simply has no streams to
+	// enumerate, and only the errno tells the two apart.
 	if h == uintptr(syscall.InvalidHandle) {
-		return nil, nil
+		if errors.Is(err, windows.ERROR_HANDLE_EOF) {
+			// Nothing to list: a directory, or a file on a volume
+			// that keeps no streams. Not a failure.
+			return nil, nil
+		}
+		// The path could not be read at all. An empty list here would
+		// be indistinguishable from a file that has no extra streams,
+		// which is the one thing this must not say.
+		return nil, err
 	}
-	defer procFindClose.Call(h)
+	defer func() {
+		// The streams have been read by the time this runs and the
+		// answer is already in hand: FindClose only lets go of the
+		// enumeration handle, and nothing about a failure to let go of
+		// it changes what was read.
+		_, _, _ = procFindClose.Call(h)
+	}()
 
 	var streams []string
 	for {
 		name := syscall.UTF16ToString(data.StreamName[:])
 		if name != "::$DATA" && name != "" {
-			cleaned := name
-			if strings.HasSuffix(cleaned, ":$DATA") {
-				cleaned = strings.TrimSuffix(cleaned, ":$DATA")
-			}
-			streams = append(streams, cleaned)
+			// A stream is enumerated as ":name:$DATA"; the archive
+			// entry that carries it is named for the stream alone.
+			streams = append(streams, strings.TrimSuffix(name, ":$DATA"))
 		}
 
 		r1, _, _ := procFindNextStreamW.Call(
@@ -262,16 +296,19 @@ func preallocate(f *os.File, size int64) error {
 	if size <= 1024*1024 {
 		return nil
 	}
-	// 1. Set physical allocation size on disk (reserves contiguous clusters on NTFS to prevent fragmentation)
-	var allocInfo int64 = size
-	procSetFileInformationByHandle.Call(
+	// Reserve the clusters on disk first. This is a hint and nothing more:
+	// what the caller is told about is the logical size set below, and a
+	// refused reservation costs a fragmented file rather than a wrong one,
+	// which is not worth failing an extraction over.
+	var allocInfo = size
+	_, _, _ = procSetFileInformationByHandle.Call(
 		f.Fd(),
 		5, // FileAllocationInfo
 		uintptr(unsafe.Pointer(&allocInfo)),
 		8, // sizeof(int64)
 	)
 
-	// 2. Set logical end-of-file (EOF)
+	// Set the logical end of file.
 	return f.Truncate(size)
 }
 

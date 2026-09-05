@@ -2,15 +2,23 @@ package zip
 
 import "encoding/binary"
 
-// appendNtfsAcl writes a Windows Security Descriptor to the 0x4453 tag
+// appendNtfsAcl writes a Windows Security Descriptor to the 0x4453 tag. A
+// descriptor too long for the tag's two-byte length is left out rather than
+// written under a length that has wrapped: the entry keeps its data and loses
+// only the ACL, which is what happens anyway on every reader that does not
+// know the tag.
 func appendNtfsAcl(extra []byte, sd []byte) []byte {
 	if len(sd) == 0 {
+		return extra
+	}
+	sdLen, err := fitUint16(len(sd), "NTFS security descriptor")
+	if err != nil {
 		return extra
 	}
 	// Format 0x4453: [ID 2b] [Size 2b] [Data...]
 	buf := make([]byte, 4+len(sd))
 	binary.LittleEndian.PutUint16(buf[0:2], ntfsAclExtraID)
-	binary.LittleEndian.PutUint16(buf[2:4], uint16(len(sd)))
+	binary.LittleEndian.PutUint16(buf[2:4], sdLen)
 	copy(buf[4:], sd)
 	return append(extra, buf...)
 }

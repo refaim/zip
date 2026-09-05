@@ -2,6 +2,7 @@ package zip
 
 import (
 	"encoding/binary"
+	"fmt"
 	"hash/crc32"
 	"io/fs"
 	"os"
@@ -173,6 +174,7 @@ type headerFileInfo struct {
 func (fi headerFileInfo) Name() string { return path.Base(fi.fh.Name) }
 func (fi headerFileInfo) Size() int64 {
 	if fi.fh.UncompressedSize64 > 0 {
+		// #nosec G115 -- headers read from an archive are held to UncompressedSize64 <= MaxInt64 by readDirectoryHeader; a header built in this process carries the caller's own number
 		return int64(fi.fh.UncompressedSize64)
 	}
 	return int64(fi.fh.UncompressedSize)
@@ -187,6 +189,13 @@ func (fi headerFileInfo) String() string             { return fs.FormatFileInfo(
 
 func FileInfoHeader(fi fs.FileInfo) (*FileHeader, error) {
 	size := fi.Size()
+	// fs.FileInfo is an interface, so the size is whatever the caller's
+	// implementation returns. A negative one read as unsigned becomes a
+	// header announcing about 2^64 bytes, which is the size the archive
+	// would then be trusted to hold.
+	if size < 0 {
+		return nil, fmt.Errorf("zip: %s reports a size of %d bytes", fi.Name(), size)
+	}
 	fh := &FileHeader{
 		Name:               fi.Name(),
 		UncompressedSize64: uint64(size),
@@ -245,7 +254,9 @@ func msDosTimeToTime(dosDate, dosTime uint16) time.Time {
 }
 
 func timeToMsDosTime(t time.Time) (fDate uint16, fTime uint16) {
+	// #nosec G115 -- APPNOTE 4.4.6: the MS-DOS date is a 16-bit field holding day, month and year-1980, and a year outside 1980-2107 has no spelling in it at all
 	fDate = uint16(t.Day() + int(t.Month())<<5 + (t.Year()-1980)<<9)
+	// #nosec G115 -- APPNOTE 4.4.6: the MS-DOS time is a 16-bit field holding two-second units, minutes and hours, all of which fit by construction
 	fTime = uint16(t.Second()/2 + t.Minute()<<5 + t.Hour()<<11)
 	return
 }
@@ -337,13 +348,20 @@ func (fh *FileHeader) injectAutoExtras() uint16 {
 		eb.uint16(extTimeExtraID)
 		eb.uint16(size)
 		eb.uint8(extTimeFlags)
+		// The extended timestamp (Info-ZIP 0x5455) holds each time as
+		// four bytes of Unix time, so what is written is the low 32 bits
+		// whatever the time is; a reader of the tag puts them back the
+		// same way. Nothing wider exists in the tag to write instead.
 		if extTimeFlags&1 != 0 {
+			// #nosec G115 -- Info-ZIP 0x5455: the field is four bytes of Unix time and this is the whole of it
 			eb.uint32(uint32(fh.Modified.Unix()))
 		}
 		if extTimeFlags&2 != 0 {
+			// #nosec G115 -- Info-ZIP 0x5455: the field is four bytes of Unix time and this is the whole of it
 			eb.uint32(uint32(fh.Accessed.Unix()))
 		}
 		if extTimeFlags&4 != 0 {
+			// #nosec G115 -- Info-ZIP 0x5455: the field is four bytes of Unix time and this is the whole of it
 			eb.uint32(uint32(fh.Created.Unix()))
 		}
 		fh.Extra = append(fh.Extra, buf...)
@@ -384,11 +402,17 @@ func (fh *FileHeader) injectAutoExtras() uint16 {
 		binary.LittleEndian.PutUint32(payload[1:5], crc)
 		copy(payload[5:], commentBytes)
 
-		buf := make([]byte, 4+len(payload))
-		binary.LittleEndian.PutUint16(buf[0:2], unicodeCommentExtraID)
-		binary.LittleEndian.PutUint16(buf[2:4], uint16(len(payload)))
-		copy(buf[4:], payload)
-		fh.Extra = append(fh.Extra, buf...)
+		// A comment with no room left for the five bytes of header the
+		// tag carries is left out of the extra field: the comment
+		// itself is still written to the entry, and a length that has
+		// wrapped would make every following tag unreadable.
+		if payloadLen, err := fitUint16(len(payload), "Unicode comment extra field"); err == nil {
+			buf := make([]byte, 4+len(payload))
+			binary.LittleEndian.PutUint16(buf[0:2], unicodeCommentExtraID)
+			binary.LittleEndian.PutUint16(buf[2:4], payloadLen)
+			copy(buf[4:], payload)
+			fh.Extra = append(fh.Extra, buf...)
+		}
 	}
 
 	// 4. AES Encryption (0x9901)

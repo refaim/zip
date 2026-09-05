@@ -5,6 +5,7 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/hmac"
+	// #nosec G505 -- WinZip AES (APPNOTE 6.3.x) requires PBKDF2-HMAC-SHA1 and an HMAC-SHA1 authentication code; the test computes the same thing the format does
 	"crypto/sha1"
 	"errors"
 	"io"
@@ -190,8 +191,11 @@ func TestWinZipAES_CorruptedMAC(t *testing.T) {
 	zr, _ := NewReader(bytes.NewReader(raw), int64(len(raw)))
 
 	off, _ := zr.File[0].DataOffset()
-	compSize := zr.File[0].CompressedSize64
-	macOffset := off + int64(compSize) - 5
+	compSize, err := u64toi64(zr.File[0].CompressedSize64)
+	if err != nil {
+		t.Fatalf("compressed size of the entry just written: %v", err)
+	}
+	macOffset := off + compSize - 5
 	t.Logf("[DEBUG-TEST] DataOffset: %d, CompressedSize64: %d, macOffset: %d", off, compSize, macOffset)
 	t.Logf("[DEBUG-TEST] Bytes before corruption: %x", raw[macOffset-5:macOffset+5])
 	raw[macOffset] ^= 0xFF
@@ -214,6 +218,7 @@ func TestWinZipAES_CorruptedMAC(t *testing.T) {
 	}
 }
 func TestWinZipAES_Writer_BufResizing(t *testing.T) {
+	// #nosec G101 -- not a credential: the literal the test encrypts a fixture archive with and then re-reads it with, so it has to be in the source
 	password := "buf-resize-pass"
 	buf := new(bytes.Buffer)
 

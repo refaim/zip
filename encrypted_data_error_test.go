@@ -34,6 +34,27 @@ func buildZipCryptoStored(t *testing.T, name string, data []byte, password strin
 	le := binary.LittleEndian
 	put16 := func(v uint16) { mustBinaryWrite(t, &buf, le, v) }
 	put32 := func(v uint32) { mustBinaryWrite(t, &buf, le, v) }
+	// The lengths and offsets below are ints, and the format keeps each of
+	// them in a two- or four-byte field. Narrowing them through a check means
+	// a fixture that outgrew a field fails the test instead of quietly
+	// writing a header that describes a different archive.
+	fit16 := func(v int) uint16 {
+		n, err := fitUint16(v, "fixture header field")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	fit32 := func(v int) uint32 {
+		// The comparison goes through uint64 because uint32max does not
+		// fit an int on a 32-bit build, which is one of the cells this
+		// suite runs on.
+		if v < 0 || uint64(v) > uint64(uint32max) {
+			t.Fatalf("fixture header field is %d, over the %d the format allows", v, uint64(uint32max))
+			return 0
+		}
+		return uint32(v)
+	}
 	// Local file header.
 	put32(0x04034b50)
 	put16(20)
@@ -42,9 +63,9 @@ func buildZipCryptoStored(t *testing.T, name string, data []byte, password strin
 	put16(0)
 	put16(0)
 	put32(crc)
-	put32(uint32(len(enc)))
-	put32(uint32(len(data)))
-	put16(uint16(len(name)))
+	put32(fit32(len(enc)))
+	put32(fit32(len(data)))
+	put16(fit16(len(name)))
 	put16(0)
 	buf.WriteString(name)
 	buf.Write(enc)
@@ -58,9 +79,9 @@ func buildZipCryptoStored(t *testing.T, name string, data []byte, password strin
 	put16(0)
 	put16(0)
 	put32(crc)
-	put32(uint32(len(enc)))
-	put32(uint32(len(data)))
-	put16(uint16(len(name)))
+	put32(fit32(len(enc)))
+	put32(fit32(len(data)))
+	put16(fit16(len(name)))
 	put16(0)
 	put16(0)
 	put16(0)
@@ -75,8 +96,8 @@ func buildZipCryptoStored(t *testing.T, name string, data []byte, password strin
 	put16(0)
 	put16(1)
 	put16(1)
-	put32(uint32(cdSize))
-	put32(uint32(cdOffset))
+	put32(fit32(cdSize))
+	put32(fit32(cdOffset))
 	put16(0)
 	return buf.Bytes()
 }

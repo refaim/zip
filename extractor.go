@@ -296,8 +296,9 @@ type extractBudget struct {
 func newExtractBudget(o *extractorOptions, written *int64) *extractBudget {
 	return &extractBudget{
 		maxFileSize: o.maxFileSize,
-		maxRatio:    uint64(o.maxDecompressionRatio),
-		written:     written,
+		// #nosec G115 -- WithExtractorMaxRatio refuses a negative ratio
+		maxRatio: uint64(o.maxDecompressionRatio),
+		written:  written,
 	}
 }
 
@@ -408,11 +409,13 @@ func (e *entryBudget) checkHeader(uncompressed uint64) error {
 // nothing reserved for it.
 func (e *entryBudget) preallocSize(declared uint64) int64 {
 	if e.b.maxFileSize > 0 {
+		// #nosec G115 -- maxFileSize is positive here, so the minimum of the two is at most an int64 the caller supplied
 		return int64(min(declared, uint64(e.b.maxFileSize)))
 	}
 	if e.compressed == 0 {
 		return 0
 	}
+	// #nosec G115 -- readDirectoryHeader and salvage both refuse an entry whose declared size is above MaxInt64
 	return int64(declared)
 }
 
@@ -449,6 +452,7 @@ func (e *entryBudget) charge(n int64) error {
 	// reader stops at the compressed size, so measuring against it can only
 	// understate the ratio of what was really consumed.
 	if e.compressed > 0 {
+		// #nosec G115 -- written counts the bytes this entry produced and only ever grows from zero
 		q, rem := uint64(e.written)/e.compressed, uint64(e.written)%e.compressed
 		if q < e.ratio || (q == e.ratio && rem == 0) {
 			return nil
@@ -509,10 +513,15 @@ type Extractor struct {
 	dirCache         sync.Map
 }
 
+// extractPasswordFromOpts reads the password out of the options before the
+// archive is opened, because opening it needs the password. The options are
+// applied again in newExtractor, which is where one the validator rejects
+// stops the call; each option writes its own field, so what is wanted here is
+// set whether or not another one is going to be refused.
 func extractPasswordFromOpts(opts []ExtractorOption) string {
 	var o extractorOptions
 	for _, opt := range opts {
-		opt(&o)
+		_ = opt(&o)
 	}
 	return o.password
 }
@@ -527,8 +536,9 @@ func NewExtractor(filename, chroot string, opts ...ExtractorOption) (*Extractor,
 	if err != nil {
 		// An option the caller got wrong is still an archive that was
 		// opened, and the handle is the caller's only through the
-		// extractor it is not getting.
-		zr.Close()
+		// extractor it is not getting. Nothing was written through it,
+		// so what closing it says is not the answer to this call.
+		_ = zr.Close()
 		return nil, err
 	}
 	return e, nil
@@ -603,7 +613,9 @@ func (e *Extractor) Extract(ctx context.Context) (err error) {
 			f, err := os.Open(e.chroot)
 			if err == nil {
 				names, err := f.Readdirnames(1)
-				f.Close()
+				// A directory that was only listed; the listing is
+				// already in hand.
+				_ = f.Close()
 				if err == nil && len(names) > 0 {
 					return errors.New("zip: refusing to extract incremental archive into a non-empty directory without a pre-existing .zip_dumpdir marker (prevents accidental data loss)")
 				}
@@ -706,7 +718,18 @@ func (e *Extractor) Extract(ctx context.Context) (err error) {
 				// Overwrite control policies
 				if file.Mode()&os.ModeDir == 0 && file.Mode()&os.ModeSymlink == 0 && file.Linkname == "" {
 					if e.options.unlinkFirst {
-						os.RemoveAll(fixOSPath(path)) // Safer than os.Remove for preventing TOCTOU directory overwrites
+						// The point of unlinkFirst is that nothing
+						// of the old name survives to be written
+						// into -- a file the caller asked to have
+						// removed and that is still there is a
+						// symlink or a read-only file the write
+						// would otherwise follow or overwrite.
+						// RemoveAll is quiet about a name that was
+						// not there, and safer than Remove against
+						// a directory swapped in mid-extraction.
+						if rerr := os.RemoveAll(fixOSPath(path)); rerr != nil {
+							return rerr
+						}
 					}
 					if e.options.keepOldFiles {
 						if _, err := os.Stat(fixOSPath(path)); err == nil {
@@ -811,7 +834,9 @@ func (e *Extractor) Extract(ctx context.Context) (err error) {
 	if e.options.incremental {
 		dumpdirPath := filepath.Join(e.chroot, ".zip_dumpdir")
 		if f, err := os.Open(dumpdirPath); err == nil {
-			defer f.Close()
+			// The listing is only read; nothing is written through
+			// this handle.
+			defer func() { _ = f.Close() }()
 			scanner := bufio.NewScanner(f)
 			activeFiles := make(map[string]bool)
 			for scanner.Scan() {
@@ -838,6 +863,18 @@ func (e *Extractor) Extract(ctx context.Context) (err error) {
 			// Whatever the walk does answer is the extraction's answer now.
 			// It was thrown away before, so a destination that could not be
 			// read was a silent no-op rather than a failure.
+			// The walk names a path and the removal below acts on it
+			// a moment later; in between, a directory on the way to it
+			// can be replaced by a symlink pointing anywhere, and a
+			// removal that followed one would delete outside the
+			// destination. A root resolves every component against the
+			// destination itself and refuses to leave it.
+			root, rerr := openRoot(e.chroot)
+			if rerr != nil {
+				return rerr
+			}
+			defer func() { _ = root.Close() }()
+
 			if werr := filepath.WalkDir(e.chroot, func(path string, d fs.DirEntry, err error) error {
 				if err != nil {
 					return err
@@ -848,12 +885,13 @@ func (e *Extractor) Extract(ctx context.Context) (err error) {
 				// WalkDir hands back paths under the root it was given, so
 				// the root is a prefix of every one of them and what is left
 				// after it is the name the listing would carry.
-				relClean := filepath.ToSlash(strings.TrimPrefix(path[len(e.chroot):], string(filepath.Separator)))
+				rel := strings.TrimPrefix(path[len(e.chroot):], string(filepath.Separator))
+				relClean := filepath.ToSlash(rel)
 				if d.IsDir() {
 					relClean += "/"
 				}
 				if !activeFiles[relClean] {
-					if rerr := os.RemoveAll(path); rerr != nil {
+					if rerr := root.RemoveAll(rel); rerr != nil {
 						return rerr
 					}
 					if d.IsDir() {
@@ -1159,13 +1197,27 @@ func (e *Extractor) extractSolidStream(r io.Reader, eb *entryBudget, ctx context
 		}
 
 		if isDir {
-			os.MkdirAll(fixOSPath(path), 0755)
-			e.updateFileMetadata(path, &File{FileHeader: *fh})
+			if merr := os.MkdirAll(fixOSPath(path), 0755); merr != nil {
+				return merr
+			}
+			if merr := e.updateFileMetadata(path, &File{FileHeader: *fh}); merr != nil {
+				if !e.options.tolerant {
+					return merr
+				}
+				fmt.Printf("zip: skipping corrupted file %q: %v\n", fh.Name, merr)
+			}
 		} else {
 			if e.options.unlinkFirst {
-				os.Remove(fixOSPath(path))
+				// A name that was not there is what unlinkFirst is
+				// asking for; anything else surviving is the file
+				// the write below would have gone into.
+				if rerr := os.Remove(fixOSPath(path)); rerr != nil && !errors.Is(rerr, fs.ErrNotExist) {
+					return rerr
+				}
 			}
-			os.MkdirAll(fixOSPath(filepath.Dir(path)), 0755)
+			if merr := os.MkdirAll(fixOSPath(filepath.Dir(path)), 0755); merr != nil {
+				return merr
+			}
 
 			writePath := path
 			if e.options.safeWrites {
@@ -1178,7 +1230,7 @@ func (e *Extractor) extractSolidStream(r io.Reader, eb *entryBudget, ctx context
 			}
 
 			hasher := crc32.NewIEEE()
-			var limitR io.Reader = io.LimitReader(r, int64(uncompSize))
+			var limitR = io.LimitReader(r, int64(uncompSize))
 
 			// The inner file is a destination file like any other, and
 			// the size limit is its own while the ratio is the solid
@@ -1189,12 +1241,20 @@ func (e *Extractor) extractSolidStream(r io.Reader, eb *entryBudget, ctx context
 			_, err = io.CopyBuffer(eb.file(f), io.TeeReader(limitR, hasher), buf)
 			putSparseBuf(buf)
 
-			f.Close()
+			// The file was just written through; what Close reports
+			// is the last of the write, and dropping it reported a
+			// truncated file as an extracted one.
+			if cerr := f.Close(); err == nil {
+				err = cerr
+			}
 			if err == nil && crc32Val != 0 && hasher.Sum32() != crc32Val {
 				err = ErrChecksum
 			}
 			if err != nil {
-				os.Remove(writePath)
+				// The extraction of this entry is already failing;
+				// what is being removed is the half-written file it
+				// produced.
+				_ = os.Remove(writePath)
 				return err
 			}
 
@@ -1231,7 +1291,12 @@ func (e *Extractor) extractSolidStream(r io.Reader, eb *entryBudget, ctx context
 				}
 			}
 
-			e.updateFileMetadata(path, &File{FileHeader: *fh})
+			if merr := e.updateFileMetadata(path, &File{FileHeader: *fh}); merr != nil {
+				if !e.options.tolerant {
+					return merr
+				}
+				fmt.Printf("zip: skipping corrupted file %q: %v\n", fh.Name, merr)
+			}
 		}
 		atomic.AddInt64(&e.entries, 1)
 	}
@@ -1318,7 +1383,9 @@ func (e *Extractor) createLink(path string, file *File, budget *extractBudget) e
 			return err
 		}
 		name, err := io.ReadAll(r)
-		r.Close()
+		// The entry was read to its end, so the checksum has already
+		// been checked and this handle has nothing left to say.
+		_ = r.Close()
 		if err != nil {
 			return err
 		}
@@ -1381,6 +1448,20 @@ func (e *Extractor) createLink(path string, file *File, budget *extractBudget) e
 	return err
 }
 
+// trimToWritten cuts a file back to the position it has been written up to.
+// preallocate may have made it longer than the entry it holds, and a tail of
+// zeros left behind is a file bigger than the archive said, which nothing
+// downstream would report. It is a function of its own so that what it does
+// when the file will not take it can be tested; from createFile the handle is
+// always one this package opened for writing and just wrote through.
+func trimToWritten(f *os.File) error {
+	currentOffset, err := f.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return err
+	}
+	return f.Truncate(currentOffset)
+}
+
 func (e *Extractor) createFile(ctx context.Context, path string, file *File, budget *extractBudget) (err error) {
 	// The header is the archive's word about bytes it has not produced
 	// yet, so it is worth a rejection before anything is opened and worth
@@ -1420,7 +1501,9 @@ func (e *Extractor) createFile(ctx context.Context, path string, file *File, bud
 			dclose(f, &err)
 		}
 		if err != nil && cleanup && !e.options.keepBroken {
-			os.Remove(fixOSPath(writePath))
+			// The entry is already failing; this is the partial file
+			// it produced being swept up.
+			_ = os.Remove(fixOSPath(writePath))
 		}
 	}()
 
@@ -1448,7 +1531,9 @@ func (e *Extractor) createFile(ctx context.Context, path string, file *File, bud
 		sanitized := sanitizeZoneIdentifier(data)
 		_, err = bw.Write(sanitized)
 		if err == nil {
-			f.Truncate(int64(len(sanitized)))
+			// Sanitising shortens the stream, so what is left of the
+			// original past the new end has to go with it.
+			err = f.Truncate(int64(len(sanitized)))
 		}
 		incOnSuccess(&e.entries, err)
 		return err
@@ -1489,9 +1574,7 @@ func (e *Extractor) createFile(ctx context.Context, path string, file *File, bud
 	// sweep of the temporary file, being in the same deferred call, failed
 	// with it and left the file behind as well.
 	if err == nil {
-		if currentOffset, serr := f.Seek(0, io.SeekCurrent); serr == nil {
-			f.Truncate(currentOffset)
-		}
+		err = trimToWritten(f)
 	}
 	dclose(f, &err)
 	closed = true
@@ -1510,21 +1593,27 @@ func (e *Extractor) createFile(ctx context.Context, path string, file *File, bud
 }
 
 // rename is os.Rename, named here so that a test can make the move fail. It
-// is the one step of an extraction with nothing of its own left to go wrong
-// by the time it runs.
+// is the one step of an extraction with no error of its own to provoke:
+// everything up to it has already succeeded by then.
 var rename = os.Rename
+
+// openRoot is os.OpenRoot, named here for the same reason: by the time the
+// incremental sweep opens the destination as a root, an entry inside it has
+// already been read, so nothing short of the directory being taken away
+// underneath the extraction makes this fail.
+var openRoot = os.OpenRoot
 
 // finishSafeWrite moves the temporary file an entry was written to onto the
 // name the archive gave it. Both paths go through fixOSPath: on Windows a
 // name ending in a dot or a space, or one longer than MAX_PATH, is only
-// reachable in its extended form, and moving without it would put the file
-// under a different name than the one everything else in the extraction used.
+// reachable in its extended form, and renaming without it would move the file
+// to a different name than the one everything else in the extraction used.
 func (e *Extractor) finishSafeWrite(writePath, path string) error {
 	if rerr := rename(fixOSPath(writePath), fixOSPath(path)); rerr != nil {
 		// The move is the error being returned; the temporary file it
 		// left behind is swept up. The handle is closed by now, so this
 		// removal works on Windows too.
-		os.Remove(fixOSPath(writePath))
+		_ = os.Remove(fixOSPath(writePath))
 		return rerr
 	}
 	return nil
@@ -1545,13 +1634,17 @@ func (e *Extractor) updateFileMetadata(path string, file *File) error {
 		return err
 	}
 
-	// Apply Windows ACL if present
+	// Access control lists and extended attributes are best effort
+	// whatever the extractor's tolerance is set to: they fail on what the
+	// destination filesystem can hold rather than on the archive, so FAT,
+	// exFAT, SMB shares and tmpfs would each turn a strict extraction into
+	// a failure for carrying metadata they have no place to put.
 	if len(file.Acl) > 0 {
-		applyNtfsAclFunc(path, file.Acl)
+		_ = applyNtfsAclFunc(path, file.Acl)
 	}
 
 	if e.options.xattrs {
-		applyXattrs(path, &file.FileHeader)
+		_ = applyXattrs(path, &file.FileHeader)
 	}
 
 	if !file.OwnerSet {

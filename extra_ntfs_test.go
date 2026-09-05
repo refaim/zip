@@ -46,14 +46,14 @@ func TestNtfsAclAndAds_Windows(t *testing.T) {
 
 	tmp := t.TempDir()
 	filePath := filepath.Join(tmp, "test.txt")
-	err := os.WriteFile(filePath, []byte("main data"), 0644)
+	err := os.WriteFile(filePath, []byte("main data"), 0600)
 	if err != nil {
 		t.Fatalf("failed to write main file: %v", err)
 	}
 
 	// Write an alternate data stream
 	adsPath := filePath + ":my_stream"
-	err = os.WriteFile(adsPath, []byte("stream data"), 0644)
+	err = os.WriteFile(adsPath, []byte("stream data"), 0600)
 	if err != nil {
 		t.Fatalf("failed to write alternate data stream: %v", err)
 	}
@@ -119,10 +119,10 @@ func TestNtfsAclAndAds_Mocked(t *testing.T) {
 
 	tmp := t.TempDir()
 	filePath := filepath.Join(tmp, "test_file.txt")
-	mustWriteFile(t, filePath, []byte("some content"), 0644)
+	mustWriteFile(t, filePath, []byte("some content"), 0600)
 
-	mustWriteFile(t, filePath+":Zone.Identifier", []byte("zone data"), 0644)
-	mustWriteFile(t, filePath+":custom_stream", []byte("custom data"), 0644)
+	mustWriteFile(t, filePath+":Zone.Identifier", []byte("zone data"), 0600)
+	mustWriteFile(t, filePath+":custom_stream", []byte("custom data"), 0600)
 
 	zipPath := filepath.Join(tmp, "archive.zip")
 	f, err := os.Create(zipPath)
