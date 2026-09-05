@@ -32,8 +32,8 @@ func buildZipCryptoStored(t *testing.T, name string, data []byte, password strin
 	}
 	var buf bytes.Buffer
 	le := binary.LittleEndian
-	put16 := func(v uint16) { _ = binary.Write(&buf, le, v) }
-	put32 := func(v uint32) { _ = binary.Write(&buf, le, v) }
+	put16 := func(v uint16) { mustBinaryWrite(t, &buf, le, v) }
+	put32 := func(v uint32) { mustBinaryWrite(t, &buf, le, v) }
 	// Local file header.
 	put32(0x04034b50)
 	put16(20)
@@ -101,7 +101,7 @@ func TestZipCrypto_CorrectPasswordReads(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	defer rc.Close()
+	closeAt(t, rc)
 	got, err := io.ReadAll(rc)
 	if err != nil || !bytes.Equal(got, data) {
 		t.Fatalf("ReadAll = %q, %v", got, err)
@@ -170,7 +170,7 @@ func TestZipCrypto_WrongPasswordPastCheckByte(t *testing.T) {
 	if err != nil {
 		t.Fatalf("check byte should now accept \"Wrong\", got %v", err)
 	}
-	defer rc.Close()
+	closeAt(t, rc)
 	_, err = io.ReadAll(rc)
 	if err == nil {
 		t.Fatal("reading with the wrong password must fail")
@@ -183,7 +183,7 @@ func TestZipCrypto_WrongPasswordPastCheckByte(t *testing.T) {
 		t.Errorf("must match both ErrPassword and ErrChecksum: %v", err)
 	}
 	if rc2, err := openSingle(t, archive, "Correct").Open(); err == nil {
-		rc2.Close()
+		closeAt(t, rc2)
 		t.Errorf("the patched archive must now reject the real password at the check byte")
 	}
 }
@@ -197,8 +197,10 @@ func TestUnencrypted_ChecksumStaysPlain(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	fw.Write([]byte("hello world"))
-	w.Close()
+	mustWrite(t, fw, []byte("hello world"))
+	if err := w.Close(); err != nil {
+		t.Fatalf("close writer: %v", err)
+	}
 	archive := buf.Bytes()
 	// Corrupt a payload byte.
 	idx := bytes.Index(archive, []byte("hello world"))
@@ -207,6 +209,7 @@ func TestUnencrypted_ChecksumStaysPlain(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	closeAt(t, rc)
 	_, err = io.ReadAll(rc)
 	if err != ErrChecksum {
 		t.Fatalf("want bare ErrChecksum, got %v", err)

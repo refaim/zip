@@ -175,6 +175,13 @@ type MultiVolumeWriter struct {
 }
 
 func NewMultiVolumeWriter(mainPath string, splitSize int64) (*MultiVolumeWriter, error) {
+	// Write fills the current volume, opens the next one and carries on, so
+	// a volume that holds nothing is a volume it opens for ever: with a
+	// split size of zero it made a new empty part on every turn of the loop
+	// and never wrote a byte of what it was given.
+	if splitSize <= 0 {
+		return nil, fmt.Errorf("zip: volume size %d is not a size", splitSize)
+	}
 	m := &MultiVolumeWriter{mainPath: mainPath, splitSize: splitSize}
 	if err := m.openNextVolume(); err != nil {
 		return nil, err

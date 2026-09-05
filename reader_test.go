@@ -24,12 +24,14 @@ func TestReader_DataDescriptorNoSignature(t *testing.T) {
 	fh.Flags |= 0x8 // Require Data Descriptor
 
 	// Write header
-	w, _ := zw.CreateHeader(fh)
-	w.Write([]byte("some data"))
+	w := mustCreateHeader(t, zw, fh)
+	mustWrite(t, w, []byte("some data"))
 
 	// archive/zip and our Writer write the signature.
 	// We verify that our Reader can handle it even if we "clip" the file.
-	zw.Close()
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
 
 	zr, err := NewReader(bytes.NewReader(buf.Bytes()), int64(buf.Len()))
 	if err != nil {
@@ -41,8 +43,8 @@ func TestReader_DataDescriptorNoSignature(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	closeAt(t, rc)
 	data, _ := io.ReadAll(rc)
-	rc.Close()
 
 	if string(data) != "some data" {
 		t.Errorf("expected 'some data', got %q", string(data))
@@ -91,7 +93,11 @@ func TestSalvageMode_ZIP64(t *testing.T) {
 	tmpDir := t.TempDir()
 	zipPath := filepath.Join(tmpDir, "broken_zip64.zip")
 
-	f, _ := os.Create(zipPath)
+	f, err := os.Create(zipPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closeAt(t, f)
 	zw := NewWriter(f)
 
 	// Force ZIP64 sizes
@@ -105,21 +111,25 @@ func TestSalvageMode_ZIP64(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	w.Write([]byte("zip64 salvage data"))
-	zw.Close()
-	f.Close()
+	mustWrite(t, w, []byte("zip64 salvage data"))
+	if err := zw.Close(); err != nil {
+		t.Fatalf("close writer: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close %s: %v", zipPath, err)
+	}
 
 	// Truncate the Central Directory
 	content, _ := os.ReadFile(zipPath)
 	truncatedContent := content[:len(content)-100]
-	os.WriteFile(zipPath, truncatedContent, 0644)
+	mustWriteFile(t, zipPath, truncatedContent, 0644)
 
 	// Salvage mode should parse the ZIP64 extra field and recover sizes
 	zr, err := OpenReader(zipPath)
 	if err != nil {
 		t.Fatalf("OpenReader failed in salvage mode: %v", err)
 	}
-	defer zr.Close()
+	closeAt(t, zr)
 
 	if len(zr.File) != 1 {
 		t.Fatalf("expected 1 file recovered, got %d", len(zr.File))
@@ -136,8 +146,8 @@ func TestSalvageMode_ZIP64(t *testing.T) {
 func TestReader_TruncatedFile(t *testing.T) {
 	// 1. Completely short file
 	_, err := NewReader(bytes.NewReader([]byte("PK")), 2)
-	if err == nil {
-		t.Error("expected error for truncated file, got nil")
+	if !errors.Is(err, ErrFormat) {
+		t.Errorf("expected ErrFormat for truncated file, got %v", err)
 	}
 
 	// 2. File with EOCD, but nothing else
@@ -145,8 +155,8 @@ func TestReader_TruncatedFile(t *testing.T) {
 	copy(data[80:], []byte("\x50\x4b\x05\x06\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"))
 	_, err = NewReader(bytes.NewReader(data), int64(len(data)))
 	// Should be a format error
-	if err == nil {
-		t.Error("expected error for corrupt/truncated directory, got nil")
+	if !errors.Is(err, ErrFormat) {
+		t.Errorf("expected ErrFormat for corrupt/truncated directory, got %v", err)
 	}
 }
 
@@ -174,7 +184,9 @@ func TestReader_EmptyArchive(t *testing.T) {
 	// Empty archive (EOCD only)
 	buf := new(bytes.Buffer)
 	zw := NewWriter(buf)
-	zw.Close()
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
 
 	zr, err := NewReader(bytes.NewReader(buf.Bytes()), int64(buf.Len()))
 	if err != nil {
@@ -189,9 +201,11 @@ func TestReader_DuplicateFiles(t *testing.T) {
 	zw := NewWriter(buf)
 
 	// Create two files with the exact same name
-	zw.Create("dup.txt")
-	zw.Create("dup.txt")
-	zw.Close()
+	mustCreate(t, zw, "dup.txt")
+	mustCreate(t, zw, "dup.txt")
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
 
 	zr, _ := NewReader(bytes.NewReader(buf.Bytes()), int64(buf.Len()))
 
@@ -200,7 +214,7 @@ func TestReader_DuplicateFiles(t *testing.T) {
 	if err != nil {
 		t.Errorf("failed to open duplicate file: %v", err)
 	} else {
-		f.Close()
+		closeAt(t, f)
 	}
 
 	// However, the internal fileList structure should mark them as duplicates
@@ -221,8 +235,12 @@ func TestReader_UnicodeArchiveComment(t *testing.T) {
 	zw := NewWriter(buf)
 	// Comment in Cyrillic for the entire archive
 	expected := "Archive comment"
-	zw.SetComment(expected)
-	zw.Close()
+	if err := zw.SetComment(expected); err != nil {
+		t.Fatalf("failed to set the archive comment: %v", err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
 
 	zr, _ := NewReader(bytes.NewReader(buf.Bytes()), int64(buf.Len()))
 	// Verify that the global comment is correctly decoded
@@ -240,10 +258,16 @@ func TestReader_PanicSafety(t *testing.T) {
 		if err == nil && zr != nil {
 			if len(zr.File) > 0 {
 				f := zr.File[0]
-				rc, _ := f.Open()
-				if rc != nil {
-					io.ReadAll(rc)
-					rc.Close()
+				rc, err := f.Open()
+				if err != nil || rc == nil {
+					continue
+				}
+				closeAt(t, rc)
+				// Junk in: a failed read is a perfectly good answer here.
+				// What this test pins is that neither the open nor the
+				// read panics on it.
+				if _, err := io.ReadAll(rc); err != nil {
+					continue
 				}
 			}
 		}
@@ -253,8 +277,10 @@ func TestReader_PanicSafety(t *testing.T) {
 func TestReader_OpenDirectoryAsFile(t *testing.T) {
 	buf := new(bytes.Buffer)
 	zw := NewWriter(buf)
-	zw.Create("my_dir/") // Create a directory
-	zw.Close()
+	mustCreate(t, zw, "my_dir/") // Create a directory
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
 
 	zr, _ := NewReader(bytes.NewReader(buf.Bytes()), int64(buf.Len()))
 	f := zr.File[0]
@@ -263,7 +289,7 @@ func TestReader_OpenDirectoryAsFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to open directory: %v", err)
 	}
-	defer rc.Close()
+	closeAt(t, rc)
 
 	// Attempting to read from a directory reader should return an error or EOF
 	_, err = rc.Read(make([]byte, 10))
@@ -290,9 +316,11 @@ func TestHiddenIndex_Corruptions(t *testing.T) {
 		SeekChunkSize:  1024,
 		SeekContinuous: true,
 	}
-	w, _ := zw.CreateHeader(fh)
-	w.Write(bytes.Repeat([]byte("A"), 4096))
-	zw.Close()
+	w := mustCreateHeader(t, zw, fh)
+	mustWrite(t, w, bytes.Repeat([]byte("A"), 4096))
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
 
 	raw := buf.Bytes()
 
@@ -311,6 +339,8 @@ func TestHiddenIndex_Corruptions(t *testing.T) {
 	_, err = zr.File[0].OpenSeekable()
 	if err == nil {
 		t.Error("expected error due to corrupted GZIDX index, got nil")
+	} else if !errors.Is(err, ErrFormat) {
+		t.Errorf("expected the refusal to be an ErrFormat, got: %v", err)
 	} else if !strings.Contains(err.Error(), "invalid GZIDX payload (too short") {
 		t.Errorf("expected specific payload length error, got: %v", err)
 	}
@@ -320,10 +350,10 @@ func TestReader_Zip64DataDescriptor(t *testing.T) {
 	// Simulate ZIP64 Data Descriptor with signature
 	// [Sig 4b] [CRC 4b] [Comp 8b] [Uncomp 8b] = 24 bytes
 	desc := new(bytes.Buffer)
-	binary.Write(desc, binary.LittleEndian, uint32(dataDescriptorSignature))
-	binary.Write(desc, binary.LittleEndian, uint32(0x12345678)) // CRC
-	binary.Write(desc, binary.LittleEndian, uint64(1000))       // Comp
-	binary.Write(desc, binary.LittleEndian, uint64(2000))       // Uncomp
+	mustBinaryWrite(t, desc, binary.LittleEndian, uint32(dataDescriptorSignature))
+	mustBinaryWrite(t, desc, binary.LittleEndian, uint32(0x12345678)) // CRC
+	mustBinaryWrite(t, desc, binary.LittleEndian, uint64(1000))       // Comp
+	mustBinaryWrite(t, desc, binary.LittleEndian, uint64(2000))       // Uncomp
 
 	f := &File{
 		FileHeader: FileHeader{CRC32: 0x12345678},
@@ -337,9 +367,9 @@ func TestReader_Zip64DataDescriptor(t *testing.T) {
 
 	// Test without signature (CRC and sizes only)
 	desc.Reset()
-	binary.Write(desc, binary.LittleEndian, uint32(0x12345678))
-	binary.Write(desc, binary.LittleEndian, uint64(1000))
-	binary.Write(desc, binary.LittleEndian, uint64(2000))
+	mustBinaryWrite(t, desc, binary.LittleEndian, uint32(0x12345678))
+	mustBinaryWrite(t, desc, binary.LittleEndian, uint64(1000))
+	mustBinaryWrite(t, desc, binary.LittleEndian, uint64(2000))
 
 	err = readDataDescriptor(desc, f)
 	if err != nil {
@@ -351,23 +381,26 @@ func TestReader_NTFSTimestamps(t *testing.T) {
 	// Prepare NTFS Extra Field (0x000a)
 	// [Tag 2b] [Size 2b] [Reserved 4b] [AttrTag 2b] [AttrSize 2b] [M/A/C 24b]
 	buf := new(bytes.Buffer)
-	binary.Write(buf, binary.LittleEndian, uint16(ntfsExtraID))
-	binary.Write(buf, binary.LittleEndian, uint16(32))
-	binary.Write(buf, binary.LittleEndian, uint32(0))  // Reserved
-	binary.Write(buf, binary.LittleEndian, uint16(1))  // AttrTag
-	binary.Write(buf, binary.LittleEndian, uint16(24)) // AttrSize
+	mustBinaryWrite(t, buf, binary.LittleEndian, uint16(ntfsExtraID))
+	mustBinaryWrite(t, buf, binary.LittleEndian, uint16(32))
+	mustBinaryWrite(t, buf, binary.LittleEndian, uint32(0))  // Reserved
+	mustBinaryWrite(t, buf, binary.LittleEndian, uint16(1))  // AttrTag
+	mustBinaryWrite(t, buf, binary.LittleEndian, uint16(24)) // AttrSize
 
 	// Ticks since 1601. 100ns precision.
 	// Use a prime number for testing: 132539520000000000 (around year 2021)
 	mtimeTick := uint64(132539520000000000)
-	binary.Write(buf, binary.LittleEndian, mtimeTick)     // Mtime
-	binary.Write(buf, binary.LittleEndian, mtimeTick+100) // Atime
-	binary.Write(buf, binary.LittleEndian, mtimeTick+200) // Ctime
+	mustBinaryWrite(t, buf, binary.LittleEndian, mtimeTick)     // Mtime
+	mustBinaryWrite(t, buf, binary.LittleEndian, mtimeTick+100) // Atime
+	mustBinaryWrite(t, buf, binary.LittleEndian, mtimeTick+200) // Ctime
 
 	f := &File{FileHeader: FileHeader{Extra: buf.Bytes()}}
 
-	// Simulate parser call
-	_ = readDirectoryHeader(f, bytes.NewReader(make([]byte, 46+100))) // dummy read
+	// A run through the parser, which a header of zero bytes has no
+	// signature for: what is under test is the extra field built above.
+	if err := readDirectoryHeader(f, bytes.NewReader(make([]byte, 46+100))); err == nil {
+		t.Fatal("expected readDirectoryHeader to reject a header of zero bytes")
+	}
 
 	// Verify that Accessed and Created are populated (parsing happens in parseExtras)
 	// For the test, call a piece of logic directly or verify through integration.
@@ -389,7 +422,7 @@ func TestLZMA_HeaderParsing(t *testing.T) {
 	// but verify that newLZMAReader doesn't panic and consumes the header.
 	rc := newLZMAReader(r)
 	if rc != nil {
-		rc.Close()
+		closeAt(t, rc)
 	}
 }
 
@@ -404,8 +437,10 @@ func TestReader_StructMetadataPopulation(t *testing.T) {
 		OwnerSet: true,
 	}
 	// Injector will fire because OwnerSet=true
-	zw.CreateHeader(fh)
-	zw.Close()
+	mustCreateHeader(t, zw, fh)
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
 
 	zr, _ := NewReader(bytes.NewReader(buf.Bytes()), int64(buf.Len()))
 	f := zr.File[0]
@@ -426,8 +461,9 @@ func TestConfig_IncludePlatformMetadata(t *testing.T) {
 	}
 
 	// 2. Enable globally
+	savedIncludePlatformMetadata := ConfigIncludePlatformMetadata
 	ConfigIncludePlatformMetadata = true
-	defer func() { ConfigIncludePlatformMetadata = false }()
+	t.Cleanup(func() { ConfigIncludePlatformMetadata = savedIncludePlatformMetadata })
 	fh2, _ := FileInfoHeader(info)
 	// On Unix it should be pulled, on Windows no, but we check the call logic.
 	// If we are on Unix, OwnerSet should become true.
@@ -441,10 +477,12 @@ func TestZip_ReadDirIncremental(t *testing.T) {
 	files := []string{"dir/a.txt", "dir/b.txt", "dir/c.txt", "dir/d.txt"}
 	for _, name := range files {
 		fh := &FileHeader{Name: name, Method: Store}
-		w, _ := zw.CreateHeader(fh)
-		w.Write([]byte("data"))
+		w := mustCreateHeader(t, zw, fh)
+		mustWrite(t, w, []byte("data"))
 	}
-	zw.Close()
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
 
 	zr, err := NewReader(bytes.NewReader(buf.Bytes()), int64(buf.Len()))
 	if err != nil {
@@ -455,7 +493,7 @@ func TestZip_ReadDirIncremental(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer dFile.Close()
+	closeAt(t, dFile)
 
 	rdf, ok := dFile.(fs.ReadDirFile)
 	if !ok {
@@ -492,37 +530,45 @@ func TestSalvageMode_Zip(t *testing.T) {
 	zipPath := filepath.Join(tmpDir, "broken.zip")
 
 	// 1. Create a valid ZIP with data in local headers
-	f, _ := os.Create(zipPath)
+	f, err := os.Create(zipPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closeAt(t, f)
 	zw := NewWriter(f)
 
 	fh1 := &FileHeader{Name: "file1.txt", Method: Store}
 	fh1.UncompressedSize64 = 5
 	fh1.CompressedSize64 = 5
-	w1, _ := zw.CreateHeader(fh1)
-	w1.Write([]byte("data1"))
+	w1 := mustCreateHeader(t, zw, fh1)
+	mustWrite(t, w1, []byte("data1"))
 
 	fh2 := &FileHeader{Name: "file2.txt", Method: Store}
 	fh2.UncompressedSize64 = 5
 	fh2.CompressedSize64 = 5
-	w2, _ := zw.CreateHeader(fh2)
-	w2.Write([]byte("data2"))
+	w2 := mustCreateHeader(t, zw, fh2)
+	mustWrite(t, w2, []byte("data2"))
 
-	zw.Close()
-	f.Close()
+	if err := zw.Close(); err != nil {
+		t.Fatalf("close writer: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close %s: %v", zipPath, err)
+	}
 
 	// 2. Determine Central Directory offset (it is at the end)
 	// and truncate the file, completely removing the "table of contents".
 	content, _ := os.ReadFile(zipPath)
 	// EOCD signature: 0x06054b50. Just cut off the last 100 bytes to be sure.
 	truncatedContent := content[:len(content)-100]
-	os.WriteFile(zipPath, truncatedContent, 0644)
+	mustWriteFile(t, zipPath, truncatedContent, 0644)
 
 	// 3. NewReader should drop into Salvage Mode and still find the files
 	zr, err := OpenReader(zipPath)
 	if err != nil {
 		t.Fatalf("OpenReader failed to salvage ZIP: %v", err)
 	}
-	defer zr.Close()
+	closeAt(t, zr)
 
 	found1, found2 := false, false
 	for _, file := range zr.File {
@@ -542,9 +588,78 @@ func TestSalvageMode_Zip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to open salvaged file: %v", err)
 	}
-	defer rc.Close()
+	closeAt(t, rc)
 	d, _ := io.ReadAll(rc)
 	if len(d) == 0 {
 		t.Error("Salvaged file content is empty")
+	}
+}
+
+// TestReadCloser_CloseReleasesFileHandles pins the handle-release path that
+// OpenReader owns. checkF4Recovery replaces the MultiVolumeReader with an
+// io.SectionReader whenever the archive carries an F4 recovery footer (and
+// checkXCryptZip does the same for an encrypted one), so Reader.r is no
+// longer the thing that holds the file handles and Close has to remember
+// them itself. Windows makes the leak loud -- an open file cannot be
+// unlinked -- while on Unix it is a silent descriptor leak.
+func TestReadCloser_CloseReleasesFileHandles(t *testing.T) {
+	tmp := t.TempDir()
+	zipPath := filepath.Join(tmp, "recovery.zip")
+
+	var buf bytes.Buffer
+	zw := NewWriter(&buf)
+	w, err := zw.Create("payload.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte("payload")); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// An F4 recovery footer is the last 32 bytes of the file: the magic in
+	// the top 16 and the size of the archive underneath at offset 8.
+	archive := buf.Bytes()
+	footer := make([]byte, 32)
+	binary.LittleEndian.PutUint64(footer[8:16], uint64(len(archive)))
+	copy(footer[16:32], magicF4Recovery)
+	if err := os.WriteFile(zipPath, append(archive, footer...), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	rc, err := OpenReader(zipPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The net only catches the bail-outs below; the close this test is about
+	// is the checked one further down, which still runs first and still has
+	// to release the handles before os.Remove.
+	closeAt(t, rc)
+	if len(rc.File) != 1 {
+		t.Fatalf("expected the footer to be trimmed and 1 entry to be read, got %d", len(rc.File))
+	}
+	if _, ok := rc.r.(*MultiVolumeReader); ok {
+		t.Fatal("test no longer exercises a wrapped reader; the footer was not honoured")
+	}
+
+	if err := rc.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if err := os.Remove(zipPath); err != nil {
+		t.Fatalf("archive still held open after Close: %v", err)
+	}
+}
+
+// TestReadCloser_ZeroValueClose covers the guard on a ReadCloser that never
+// opened anything. The type is exported, so a caller can hold one before it
+// has been filled in -- a declared variable an error path returns before
+// OpenReader gets to it -- and Close on it has to be an answer rather than a
+// nil dereference.
+func TestReadCloser_ZeroValueClose(t *testing.T) {
+	var rc ReadCloser
+	if err := rc.Close(); err != nil {
+		t.Errorf("closing a zero-value ReadCloser = %v, want no error", err)
 	}
 }

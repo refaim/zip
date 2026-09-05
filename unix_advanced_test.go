@@ -17,7 +17,7 @@ import (
 func TestUnixLinks_Zip(t *testing.T) {
 	tmpDir := t.TempDir()
 	srcDir := filepath.Join(tmpDir, "src")
-	os.MkdirAll(srcDir, 0755)
+	mustMkdirAll(t, srcDir)
 
 	targetPath := filepath.Join(srcDir, "target.txt")
 	if err := os.WriteFile(targetPath, []byte("link_target"), 0644); err != nil {
@@ -40,32 +40,40 @@ func TestUnixLinks_Zip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	closeAt(t, f)
 	a, err := NewArchiver(f, filepath.Dir(srcDir))
 	if err != nil {
 		t.Fatal(err)
 	}
+	closeAt(t, a)
 
 	files := make(map[string]os.FileInfo)
-	filepath.Walk(srcDir, func(path string, info os.FileInfo, err error) error {
+	if err := filepath.Walk(srcDir, func(path string, info os.FileInfo, err error) error {
 		if path != filepath.Dir(srcDir) {
 			files[path] = info
 		}
 		return nil
-	})
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	if err := a.Archive(context.Background(), files); err != nil {
 		t.Fatal(err)
 	}
-	a.Close()
-	f.Close()
+	if err := a.Close(); err != nil {
+		t.Fatalf("close archiver: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close %s: %v", archivePath, err)
+	}
 
 	// Diagnostic 1: Inspect the generated ZIP file structure before extracting
 	zrCheck, errCheck := OpenReader(archivePath)
 	if errCheck == nil {
+		closeAt(t, zrCheck)
 		for _, f := range zrCheck.File {
 			t.Logf("[DIAGNOSTIC ZIP] Name: %q, Linkname: %q, ExtraLen: %d, ExtraHex: %x", f.Name, f.Linkname, len(f.Extra), f.Extra)
 		}
-		zrCheck.Close()
 	} else {
 		t.Logf("[DIAGNOSTIC ZIP] Failed to open reader for check: %v", errCheck)
 	}
@@ -75,10 +83,10 @@ func TestUnixLinks_Zip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	closeAt(t, e)
 	if err := e.Extract(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	e.Close()
 
 	// Diagnostic 2: Inspect extracted files on disk
 	targetPathDst := filepath.Join(dstDir, "src", "target.txt")
@@ -123,6 +131,7 @@ func TestExtractor_Fifo_Zip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	closeAt(t, f)
 	zw := NewWriter(f)
 
 	fh := &FileHeader{
@@ -133,8 +142,12 @@ func TestExtractor_Fifo_Zip(t *testing.T) {
 	if _, err := zw.CreateHeader(fh); err != nil {
 		t.Fatal(err)
 	}
-	zw.Close()
-	f.Close()
+	if err := zw.Close(); err != nil {
+		t.Fatalf("close writer: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close %s: %v", archivePath, err)
+	}
 
 	ignoreChown := WithExtractorChownErrorHandler(func(name string, err error) error {
 		return nil
@@ -143,7 +156,7 @@ func TestExtractor_Fifo_Zip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer e.Close()
+	closeAt(t, e)
 
 	err = e.Extract(context.Background())
 	if err != nil {
@@ -162,7 +175,7 @@ func TestExtractor_Fifo_Zip(t *testing.T) {
 func TestXattrs_Zip(t *testing.T) {
 	tmpDir := t.TempDir()
 	srcFile := filepath.Join(tmpDir, "src.txt")
-	os.WriteFile(srcFile, []byte("data"), 0644)
+	mustWriteFile(t, srcFile, []byte("data"), 0644)
 
 	err := unix.Setxattr(srcFile, "user.testattr", []byte("testvalue"), 0)
 	if err != nil {
@@ -170,28 +183,40 @@ func TestXattrs_Zip(t *testing.T) {
 	}
 
 	archivePath := filepath.Join(tmpDir, "xattr.zip")
-	f, _ := os.Create(archivePath)
+	f, err := os.Create(archivePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closeAt(t, f)
 	a, err := NewArchiver(f, tmpDir, WithArchiverXattrs(true))
 	if err != nil {
 		t.Fatal(err)
 	}
+	closeAt(t, a)
 
-	fi, _ := os.Stat(srcFile)
+	fi, err := os.Stat(srcFile)
+	if err != nil {
+		t.Fatal(err)
+	}
 	files := map[string]os.FileInfo{srcFile: fi}
 
 	if err := a.Archive(context.Background(), files); err != nil {
 		t.Fatal(err)
 	}
-	a.Close()
-	f.Close()
+	if err := a.Close(); err != nil {
+		t.Fatalf("close archiver: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close %s: %v", archivePath, err)
+	}
 
 	// Diagnostic 1: Inspect the generated ZIP file structure before extracting
 	zrCheck, errCheck := OpenReader(archivePath)
 	if errCheck == nil {
+		closeAt(t, zrCheck)
 		for _, f := range zrCheck.File {
 			t.Logf("[DIAGNOSTIC ZIP] Name: %q, Xattrs: %+v, ExtraLen: %d, ExtraHex: %x", f.Name, f.Xattrs, len(f.Extra), f.Extra)
 		}
-		zrCheck.Close()
 	} else {
 		t.Logf("[DIAGNOSTIC ZIP] Failed to open reader for check: %v", errCheck)
 	}
@@ -201,10 +226,10 @@ func TestXattrs_Zip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	closeAt(t, e)
 	if err := e.Extract(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	e.Close()
 
 	dstFile := filepath.Join(dstDir, "src.txt")
 
@@ -213,8 +238,11 @@ func TestXattrs_Zip(t *testing.T) {
 	t.Logf("[DIAGNOSTIC DISK] Llistxattr size: %d, err: %v", szList, errList)
 	if errList == nil && szList > 0 {
 		listBuf := make([]byte, szList)
-		unix.Llistxattr(dstFile, listBuf)
-		t.Logf("[DIAGNOSTIC DISK] Extracted xattr keys list: %q", string(listBuf))
+		if _, err := unix.Llistxattr(dstFile, listBuf); err != nil {
+			t.Logf("[DIAGNOSTIC DISK] Llistxattr into buffer failed: %v", err)
+		} else {
+			t.Logf("[DIAGNOSTIC DISK] Extracted xattr keys list: %q", string(listBuf))
+		}
 	}
 
 	val := make([]byte, 100)
@@ -237,6 +265,7 @@ func TestUnixOwnerStrings_Zip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	closeAt(t, f)
 	zw := NewWriter(f)
 
 	currentUser, err := user.Current()
@@ -260,9 +289,13 @@ func TestUnixOwnerStrings_Zip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	w.Write([]byte("owner data"))
-	zw.Close()
-	f.Close()
+	mustWrite(t, w, []byte("owner data"))
+	if err := zw.Close(); err != nil {
+		t.Fatalf("close writer: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close %s: %v", zipPath, err)
+	}
 
 	e1, err := NewExtractor(zipPath, dstDir1, WithExtractorChownErrorHandler(func(name string, err error) error {
 		return nil
@@ -270,10 +303,10 @@ func TestUnixOwnerStrings_Zip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	closeAt(t, e1)
 	if err := e1.Extract(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	e1.Close()
 
 	e2, err := NewExtractor(zipPath, dstDir2, WithExtractorNumericOwner(true), WithExtractorChownErrorHandler(func(name string, err error) error {
 		return nil
@@ -281,16 +314,16 @@ func TestUnixOwnerStrings_Zip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	closeAt(t, e2)
 	if err := e2.Extract(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	e2.Close()
 
 	zr, err := OpenReader(zipPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer zr.Close()
+	closeAt(t, zr)
 
 	fileHeader := &zr.File[0].FileHeader
 
@@ -327,5 +360,107 @@ func TestCreateWindowsSymlinkStub(t *testing.T) {
 	}
 	if _, err := os.Lstat(link); !os.IsNotExist(err) {
 		t.Errorf("the stub made something at %s: %v", link, err)
+	}
+}
+
+// TestExtractor_IncrementalSweepReportsWhatItCannotDo covers the answers the
+// sweep has to give rather than swallow.
+//
+// The walk's own answer used to be discarded, so a destination the sweep could
+// not read or could not clean was a silent no-op: the extraction reported
+// success and the stale files stayed. Both halves are reachable only through
+// directory permissions, which is a Unix matter, and only as somebody who is
+// subject to them -- root is not.
+func TestExtractor_IncrementalSweepReportsWhatItCannotDo(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root is not subject to the directory permissions this needs")
+	}
+
+	// listing names the directory, so the sweep keeps it and walks into it.
+	build := func(t *testing.T, dstDir, dirName string, mode os.FileMode, stale bool) string {
+		t.Helper()
+		tmp := filepath.Dir(dstDir)
+		zipPath := filepath.Join(tmp, "incr.zip")
+		f, err := os.Create(zipPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		closeAt(t, f)
+		zw := NewWriter(f)
+		for _, ent := range []struct{ name, content string }{
+			{".zip_dumpdir", dirName + "/\n"},
+			{"keep.txt", "kept"},
+		} {
+			fh := &FileHeader{Name: ent.name, Method: Store}
+			fh.SetMode(0644)
+			w, err := zw.CreateHeader(fh)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := w.Write([]byte(ent.content)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := zw.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := f.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		dir := filepath.Join(dstDir, dirName)
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dstDir, ".zip_dumpdir"), []byte("\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if stale {
+			if err := os.WriteFile(filepath.Join(dir, "stale.txt"), []byte("stale"), 0644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := os.Chmod(dir, mode); err != nil {
+			t.Fatal(err)
+		}
+		// t.TempDir cannot clean up what it cannot enter or write.
+		t.Cleanup(func() {
+			if err := os.Chmod(dir, 0755); err != nil {
+				t.Errorf("restoring the mode of %s: %v", dir, err)
+			}
+		})
+		return zipPath
+	}
+
+	tests := []struct {
+		name  string
+		mode  os.FileMode
+		stale bool
+	}{
+		// Not readable at all: the walk fails to list it and says so.
+		{"a directory the sweep cannot read", 0o000, false},
+		// Readable but not writable: the walk lists the stale file inside and
+		// then cannot take it away.
+		{"a directory the sweep cannot empty", 0o500, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tmp := t.TempDir()
+			dstDir := filepath.Join(tmp, "out")
+			if err := os.MkdirAll(dstDir, 0755); err != nil {
+				t.Fatal(err)
+			}
+			zipPath := build(t, dstDir, "blocked", tt.mode, tt.stale)
+
+			e, err := NewExtractor(zipPath, dstDir, WithExtractorIncremental(true))
+			if err != nil {
+				t.Fatal(err)
+			}
+			closeAt(t, e)
+			if err := e.Extract(context.Background()); err == nil {
+				t.Fatal("the sweep reported success on a destination it could not finish")
+			}
+		})
 	}
 }

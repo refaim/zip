@@ -17,7 +17,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"unicode/utf8"
 
 	"github.com/klauspost/compress/flate"
 	"github.com/unxed/zipcharset"
@@ -99,7 +98,12 @@ type Reader struct {
 }
 
 type ReadCloser struct {
-	f *os.File
+	// volumes holds the open file handles OpenReader took, independently of
+	// what ended up in Reader.r. The two are not the same thing: an archive
+	// with an F4 recovery footer or an XCrypt payload gets its reader
+	// replaced by a wrapper, and a wrapper has no way to close the files
+	// underneath it.
+	volumes *MultiVolumeReader
 	Reader
 }
 
@@ -130,6 +134,7 @@ func OpenReaderWithPassword(name string, password string) (*ReadCloser, error) {
 	}
 
 	zr := new(ReadCloser)
+	zr.volumes = mvr
 	if password != "" {
 		zr.SetPassword(password)
 	}
@@ -336,10 +341,14 @@ func (r *Reader) SetPassword(password string) {
 }
 
 func (rc *ReadCloser) Close() error {
-	if mvr, ok := rc.Reader.r.(*MultiVolumeReader); ok {
-		return mvr.Close()
+	// ReadCloser is exported, so a caller can hold one that never opened
+	// anything -- a variable declared before the OpenReader that would have
+	// filled it in returned an error. Closing that is not a failure, it is
+	// nothing to do.
+	if rc.volumes == nil {
+		return nil
 	}
-	return rc.f.Close()
+	return rc.volumes.Close()
 }
 
 func (f *File) HeaderOffset() int64 {
@@ -971,15 +980,12 @@ func readDirectoryHeader(f *File, r io.Reader) error {
 	packOS := byte(f.CreatorVersion >> 8)
 	packVer := f.CreatorVersion & 0xFF
 
-	f.Name = zipcharset.DecodeText(rawName, isUTF8, packOS, packVer, f.Extra, false)
-	if !utf8.ValidString(f.Name) {
-		f.Name = decodeUTF8OrMap([]byte(f.Name))
-	}
+	// decodeUTF8OrMap makes the validity check itself and answers a valid
+	// string with itself, so repeating the check here would only give it a
+	// second spelling to disagree with.
+	f.Name = decodeUTF8OrMap([]byte(zipcharset.DecodeText(rawName, isUTF8, packOS, packVer, f.Extra, false)))
 	f.Name = strings.ReplaceAll(f.Name, "\\", "/")
-	f.Comment = zipcharset.DecodeText(rawComment, isUTF8, packOS, packVer, f.Extra, true)
-	if !utf8.ValidString(f.Comment) {
-		f.Comment = decodeUTF8OrMap([]byte(f.Comment))
-	}
+	f.Comment = decodeUTF8OrMap([]byte(zipcharset.DecodeText(rawComment, isUTF8, packOS, packVer, f.Extra, true)))
 
 	utf8Valid1, utf8Require1 := detectUTF8(f.Name)
 	utf8Valid2, utf8Require2 := detectUTF8(f.Comment)
@@ -1073,7 +1079,14 @@ parseExtras:
 						f.Devmajor = int64(fieldBuf.uint32())
 						f.Devminor = int64(fieldBuf.uint32())
 					} else {
-						f.Linkname = string(fieldBuf)
+						// The same mapping Name and Comment go through.
+						// A link target is a name like any other and can
+						// be just as undecodable, and leaving it raw here
+						// left it the one archive-derived string with no
+						// mark to say so -- after which osFileName handed
+						// it straight back and the link was made to bytes
+						// no file had been written under.
+						f.Linkname = decodeUTF8OrMap(fieldBuf)
 					}
 				}
 			}

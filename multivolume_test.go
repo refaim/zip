@@ -14,14 +14,14 @@ func TestMultiVolumeReader_ReadAt(t *testing.T) {
 	vol1Path := filepath.Join(tmp, "test.z01")
 	zipPath := filepath.Join(tmp, "test.zip")
 
-	os.WriteFile(vol1Path, []byte("12345"), 0644)
-	os.WriteFile(zipPath, []byte("67890"), 0644)
+	mustWriteFile(t, vol1Path, []byte("12345"), 0644)
+	mustWriteFile(t, zipPath, []byte("67890"), 0644)
 
 	ra, size, err := OpenMultiVolume(zipPath, os.O_RDONLY)
 	if err != nil {
 		t.Fatalf("failed to open multivolume: %v", err)
 	}
-	defer ra.Close()
+	closeAt(t, ra)
 
 	if size != 10 {
 		t.Errorf("expected size 10, got %d", size)
@@ -45,14 +45,14 @@ func TestMultiVolumeReader_Casing(t *testing.T) {
 	vol1Path := filepath.Join(tmp, "test_case.Z01")
 	zipPath := filepath.Join(tmp, "test_case.ZIP")
 
-	os.WriteFile(vol1Path, []byte("ABCDE"), 0644)
-	os.WriteFile(zipPath, []byte("FGHIJ"), 0644)
+	mustWriteFile(t, vol1Path, []byte("ABCDE"), 0644)
+	mustWriteFile(t, zipPath, []byte("FGHIJ"), 0644)
 
 	ra, size, err := OpenMultiVolume(zipPath, os.O_RDONLY)
 	if err != nil {
 		t.Fatalf("failed to open multivolume: %v", err)
 	}
-	defer ra.Close()
+	closeAt(t, ra)
 
 	if size != 10 {
 		t.Errorf("expected size 10, got %d", size)
@@ -76,6 +76,7 @@ func TestMultiVolumeWriter_Roundtrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create MultiVolumeWriter: %v", err)
 	}
+	closeAt(t, mvw)
 
 	data := []byte("abcdefghijklmnopqrstuvwxyz") // 26 bytes -> z01(10), z02(10), zip(6)
 	if _, err := mvw.Write(data); err != nil {
@@ -100,7 +101,7 @@ func TestMultiVolumeWriter_Roundtrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to open multi-volume reader: %v", err)
 	}
-	defer mvr.Close()
+	closeAt(t, mvr)
 
 	if totalSize != int64(len(data)) {
 		t.Errorf("expected size %d, got %d", len(data), totalSize)

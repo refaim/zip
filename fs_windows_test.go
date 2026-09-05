@@ -425,3 +425,27 @@ func TestCopyFileContents(t *testing.T) {
 		t.Error("copying a directory's contents succeeded")
 	}
 }
+
+// TestRemoveHeldElsewhere covers the two spellings Windows uses for a file
+// another process still has open, and the ones it does not: a scratch file
+// that is simply gone, or a path the caller got wrong, is not something to
+// wait for.
+func TestRemoveHeldElsewhere(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"sharing violation", &os.PathError{Op: "remove", Path: "x", Err: windows.ERROR_SHARING_VIOLATION}, true},
+		{"access denied", &os.PathError{Op: "remove", Path: "x", Err: windows.ERROR_ACCESS_DENIED}, true},
+		{"not found", &os.PathError{Op: "remove", Path: "x", Err: windows.ERROR_FILE_NOT_FOUND}, false},
+		{"not a syscall error", errors.New("something else"), false},
+		{"no error", nil, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := removeHeldElsewhere(tc.err); got != tc.want {
+				t.Errorf("removeHeldElsewhere(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+}

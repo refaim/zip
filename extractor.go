@@ -310,6 +310,44 @@ func (b *extractBudget) fallbackTooLarge(declared uint64) bool {
 	return b.maxFileSize > 0 && declared/10 > uint64(b.maxFileSize)
 }
 
+// The solid fallback's scratch file is made and unmade through these four
+// names. Whether a removal failed because something outside this process still
+// holds the file is a property of the machine rather than of the archive -- on
+// Windows a scanner opening what was just written is ordinary -- and a
+// destination that will not take a file at all is a property of the
+// filesystem, so both are driven through here from either platform.
+var (
+	scratchCreate        = os.CreateTemp
+	scratchRemove        = os.Remove
+	scratchSleep         = time.Sleep
+	scratchHeldElsewhere = removeHeldElsewhere
+)
+
+const (
+	scratchRemoveTries = 10
+	scratchRemoveDelay = 100 * time.Millisecond
+)
+
+// removeScratch removes name, giving a holder outside this process the moment
+// it needs to let go. Everything the extraction itself had open on the file is
+// closed before the first attempt, so a refusal here comes from elsewhere and
+// is usually over within a moment -- the same reason testing's own temp
+// directory cleanup waits rather than failing on the first answer.
+//
+// The wait is for holders outside the process and for nothing else. A handle
+// this package leaked would be let go of by a finalizer somewhere inside the
+// same second and the removal would then succeed, which is why the tests count
+// the attempts on the path that is meant to work: a retry there is the leak
+// showing itself, not the wait doing its job.
+func removeScratch(name string) error {
+	err := scratchRemove(name)
+	for tries := 1; err != nil && tries < scratchRemoveTries && scratchHeldElsewhere(err); tries++ {
+		scratchSleep(scratchRemoveDelay)
+		err = scratchRemove(name)
+	}
+	return err
+}
+
 // entryBudget accounts for one archive entry. The ratio is measured against
 // this entry's compressed size, which is what the archive spends on it, and on
 // the solid path every inner file the entry unpacks into counts towards the
@@ -578,99 +616,8 @@ func (e *Extractor) Extract(ctx context.Context) (err error) {
 	budget := newExtractBudget(&e.options, &e.written)
 
 	if len(e.zr.File) == 1 && (e.zr.File[0].Name == "Solid.zip" || strings.HasSuffix(e.zr.File[0].Name, ".solid")) {
-		// A solid archive is one entry holding a whole zip, so everything
-		// it unpacks into -- every inner file, and the temp copy the
-		// fallback makes -- is accounted against that one entry.
-		eb := budget.entry(e.zr.File[0])
-
-		r, err := e.zr.File[0].Open()
-		if err != nil {
-			return err
-		}
-		defer r.Close()
-
-		err = e.extractSolidStream(r, eb, ctx)
-		if err != nil {
-			// A refusal by the budget is the extraction's own answer
-			// about this archive rather than a stream it could not
-			// read, and the fallback has nothing to make of it but the
-			// same answer again, after copying the whole entry to a
-			// temp file to arrive at it.
-			if errors.Is(err, ErrSizeLimit) || errors.Is(err, ErrRatioLimit) {
-				return err
-			}
-			if budget.fallbackTooLarge(e.zr.File[0].UncompressedSize64) {
-				return fmt.Errorf("zip: Solid archive too large for temp file fallback (%d bytes)", e.zr.File[0].UncompressedSize64)
-			}
-
-			// Use chroot instead of /tmp to ensure enough space and security
-			os.MkdirAll(e.chroot, 0755)
-			tempFile, terr := os.CreateTemp(e.chroot, "solid_fallback_*.zip")
-			if terr != nil {
-				return fmt.Errorf("fallback failed: %v, original: %v", terr, err)
-			}
-			defer os.Remove(tempFile.Name())
-			defer tempFile.Close()
-
-			r2, terr := e.zr.File[0].Open()
-			if terr != nil {
-				return err
-			}
-
-			// The copy is a second pass over the same entry rather
-			// than more of the first, so it is measured on its own:
-			// charging both passes to one budget makes an honest
-			// archive look like it expanded twice as far as it did.
-			fb := budget.entry(e.zr.File[0])
-
-			buf := getSparseBuf()
-			_, terr = io.CopyBuffer(fb.scratch(tempFile), &ctxReader{r: r2, ctx: ctx}, buf)
-			putSparseBuf(buf)
-
-			r2.Close()
-			if terr != nil {
-				// A copy the budget refused is the extraction's own
-				// answer about this archive, not a sign that the
-				// archive could not be read, so it is the one to
-				// give back.
-				if errors.Is(terr, ErrSizeLimit) || errors.Is(terr, ErrRatioLimit) {
-					return terr
-				}
-				return err
-			}
-
-			innerOpts := []ExtractorOption{
-				WithExtractorConcurrency(e.options.concurrency),
-				WithExtractorChownErrorHandler(e.options.chownErrorHandler),
-				WithExtractorMaxFileSize(e.options.maxFileSize),
-				WithExtractorMaxRatio(e.options.maxDecompressionRatio),
-				WithExtractorXattrs(e.options.xattrs),
-				WithExtractorKeepBroken(e.options.keepBroken),
-				WithExtractorKeepOldFiles(e.options.keepOldFiles),
-				WithExtractorKeepNewerFiles(e.options.keepNewerFiles),
-				WithExtractorNoTimes(e.options.noTimes),
-				WithExtractorStripComponents(e.options.stripComponents),
-				WithExtractorSparse(e.options.sparse),
-				WithExtractorSafeWrites(e.options.safeWrites),
-				WithExtractorUnlinkFirst(e.options.unlinkFirst),
-				WithExtractorNumericOwner(e.options.numericOwner),
-				WithExtractorIncremental(e.options.incremental),
-			}
-
-			innerExtractor, terr := NewExtractor(tempFile.Name(), e.chroot, innerOpts...)
-			if terr != nil {
-				return err
-			}
-			defer innerExtractor.Close()
-
-			ierr := innerExtractor.Extract(ctx)
-			// What the second extractor wrote is what this extraction
-			// wrote: the archive was handed on to it, and the caller
-			// asked this one what came out.
-			ibytes, ientries := innerExtractor.Written()
-			atomic.AddInt64(&e.written, ibytes)
-			atomic.AddInt64(&e.entries, ientries)
-			return ierr
+		if serr := e.extractSolid(ctx, budget); serr != nil {
+			return serr
 		}
 	} else {
 		type extractTask struct {
@@ -870,35 +817,210 @@ func (e *Extractor) Extract(ctx context.Context) (err error) {
 			for scanner.Scan() {
 				line := strings.TrimSpace(scanner.Text())
 				if line != "" {
-					activeFiles[line] = true
+					// The listing is written from the source tree, so a
+					// line in it is the archive's own bytes, while what is
+					// on disk went to disk through the platform's spelling.
+					// Comparing the two as they stand finds no match for an
+					// undecodable name, and the sweep below then takes the
+					// file that was extracted a moment earlier.
+					activeFiles[osRawBytes([]byte(line))] = true
 				}
 			}
 			activeFiles[".zip_dumpdir"] = true
 
-			filepath.WalkDir(e.chroot, func(path string, d fs.DirEntry, err error) error {
+			// Removing a directory pulls the ground out from under the
+			// walk's own descent into it: the walk asks again with the error
+			// that follows, and handing that back ends the walk, so one stale
+			// directory left everything sorting after it in place. SkipDir
+			// says there is nothing down there to visit, which is true --
+			// it has just been taken away -- and the walk carries on.
+			//
+			// Whatever the walk does answer is the extraction's answer now.
+			// It was thrown away before, so a destination that could not be
+			// read was a silent no-op rather than a failure.
+			if werr := filepath.WalkDir(e.chroot, func(path string, d fs.DirEntry, err error) error {
 				if err != nil {
 					return err
 				}
 				if path == e.chroot {
 					return nil
 				}
-				rel, err := filepath.Rel(e.chroot, path)
-				if err != nil {
-					return err
-				}
-				relClean := filepath.ToSlash(rel)
+				// WalkDir hands back paths under the root it was given, so
+				// the root is a prefix of every one of them and what is left
+				// after it is the name the listing would carry.
+				relClean := filepath.ToSlash(strings.TrimPrefix(path[len(e.chroot):], string(filepath.Separator)))
 				if d.IsDir() {
 					relClean += "/"
 				}
 				if !activeFiles[relClean] {
-					os.RemoveAll(path)
+					if rerr := os.RemoveAll(path); rerr != nil {
+						return rerr
+					}
+					if d.IsDir() {
+						return fs.SkipDir
+					}
 				}
 				return nil
-			})
+			}); werr != nil {
+				return werr
+			}
 		}
 	}
 
 	return nil
+}
+
+// extractSolid unpacks the single entry a solid archive holds. The streaming
+// pass reads the inner archive's local headers as they arrive; when that fails
+// for a reason other than the budget's own refusal, extractSolidFallback
+// copies the entry out and points a second extractor at the copy.
+func (e *Extractor) extractSolid(ctx context.Context, budget *extractBudget) error {
+	// A solid archive is one entry holding a whole zip, so everything it
+	// unpacks into -- every inner file, and the copy the fallback makes --
+	// is accounted against that one entry.
+	eb := budget.entry(e.zr.File[0])
+
+	r, err := e.zr.File[0].Open()
+	if err != nil {
+		return err
+	}
+	serr := e.extractSolidStream(r, eb, ctx)
+	// The fallback below opens the entry again rather than reading on from
+	// here, so the handle is done with whichever way the pass went.
+	cerr := r.Close()
+	if serr == nil {
+		// A stream that was read and then would not close is not a
+		// stream that could not be read as it arrived, which is the
+		// only thing the fallback has an answer for: copying the entry
+		// out and extracting it a second time over a destination that
+		// is already right would say nothing about the close.
+		return cerr
+	}
+
+	// A refusal by the budget is the extraction's own answer about this
+	// archive rather than a stream it could not read, and the fallback has
+	// nothing to make of it but the same answer again, after copying the
+	// whole entry to a scratch file to arrive at it.
+	// cerr is not looked at from here on: the stream said what is wrong with
+	// this archive, and a handle that would not close afterwards adds nothing
+	// to it.
+	if errors.Is(serr, ErrSizeLimit) || errors.Is(serr, ErrRatioLimit) {
+		return serr
+	}
+	if budget.fallbackTooLarge(e.zr.File[0].UncompressedSize64) {
+		return fmt.Errorf("zip: Solid archive too large for temp file fallback (%d bytes)", e.zr.File[0].UncompressedSize64)
+	}
+	return e.extractSolidFallback(ctx, budget, serr)
+}
+
+// extractSolidFallback copies the solid entry to a scratch file and extracts
+// that, for the archives the streaming pass cannot read as it goes.
+//
+// The scratch file goes into the destination rather than a system temp
+// directory: the destination is the only place the caller gave permission to
+// write, and it is the volume the extraction was sized against. The random
+// suffix os.CreateTemp gives it is what keeps an inner entry from colliding
+// with it by choosing a name.
+func (e *Extractor) extractSolidFallback(ctx context.Context, budget *extractBudget, streamErr error) error {
+	if err := os.MkdirAll(e.chroot, 0755); err != nil {
+		return fmt.Errorf("fallback failed: %v, original: %v", err, streamErr)
+	}
+	tempFile, terr := scratchCreate(e.chroot, "solid_fallback_*.zip")
+	if terr != nil {
+		return fmt.Errorf("fallback failed: %v, original: %v", terr, streamErr)
+	}
+	scratch := tempFile.Name()
+
+	// The safety net for the paths that give up before the teardown at the
+	// end. An extraction that already failed has an answer for the caller
+	// and a scratch file it could not remove is not a better one, so what
+	// happens here is deliberately not looked at.
+	tornDown := false
+	defer func() {
+		if tornDown {
+			return
+		}
+		_ = tempFile.Close()
+		_ = removeScratch(scratch)
+	}()
+
+	r2, terr := e.zr.File[0].Open()
+	if terr != nil {
+		return streamErr
+	}
+
+	// The copy is a second pass over the same entry rather than more of the
+	// first, so it is measured on its own: charging both passes to one
+	// budget makes an honest archive look like it expanded twice as far as
+	// it did.
+	fb := budget.entry(e.zr.File[0])
+
+	buf := getSparseBuf()
+	_, terr = io.CopyBuffer(fb.scratch(tempFile), &ctxReader{r: r2, ctx: ctx}, buf)
+	putSparseBuf(buf)
+	if cerr := r2.Close(); cerr != nil && terr == nil {
+		terr = cerr
+	}
+	if terr != nil {
+		// A copy the budget refused is the extraction's own answer about
+		// this archive, not a sign that the archive could not be read, so
+		// it is the one to give back.
+		if errors.Is(terr, ErrSizeLimit) || errors.Is(terr, ErrRatioLimit) {
+			return terr
+		}
+		return streamErr
+	}
+
+	// The inner extraction is not an incremental one, whatever the caller
+	// asked this one for. Its destination already holds the scratch file it
+	// is reading from: an incremental extractor refuses a destination that
+	// holds anything it did not put there, and its closing sweep would take
+	// the scratch file for a leftover and delete the archive out from under
+	// itself. The sweep this extraction owes its caller runs in Extract
+	// instead, once the scratch file is gone and the tree is final.
+	innerOpts := []ExtractorOption{
+		WithExtractorConcurrency(e.options.concurrency),
+		WithExtractorChownErrorHandler(e.options.chownErrorHandler),
+		WithExtractorMaxFileSize(e.options.maxFileSize),
+		WithExtractorMaxRatio(e.options.maxDecompressionRatio),
+		WithExtractorXattrs(e.options.xattrs),
+		WithExtractorKeepBroken(e.options.keepBroken),
+		WithExtractorKeepOldFiles(e.options.keepOldFiles),
+		WithExtractorKeepNewerFiles(e.options.keepNewerFiles),
+		WithExtractorNoTimes(e.options.noTimes),
+		WithExtractorStripComponents(e.options.stripComponents),
+		WithExtractorSparse(e.options.sparse),
+		WithExtractorSafeWrites(e.options.safeWrites),
+		WithExtractorUnlinkFirst(e.options.unlinkFirst),
+		WithExtractorNumericOwner(e.options.numericOwner),
+	}
+
+	innerExtractor, terr := NewExtractor(scratch, e.chroot, innerOpts...)
+	if terr != nil {
+		return streamErr
+	}
+
+	err := innerExtractor.Extract(ctx)
+	// What the second extractor wrote is what this extraction wrote: the
+	// archive was handed on to it, and the caller asked this one what came
+	// out.
+	ibytes, ientries := innerExtractor.Written()
+	atomic.AddInt64(&e.written, ibytes)
+	atomic.AddInt64(&e.entries, ientries)
+
+	// Teardown in the order the scratch file can be removed in: the reader
+	// over it first, then the handle the copy was written through, then the
+	// name. A removal that fails after the extraction succeeded is the
+	// extraction's failure -- a destination left holding a copy of the
+	// archive is not what the caller asked for -- and the message says
+	// which file is still there.
+	tornDown = true
+	dclose(innerExtractor, &err)
+	dclose(tempFile, &err)
+	if rerr := removeScratch(scratch); rerr != nil && err == nil {
+		err = fmt.Errorf("zip: solid fallback could not remove its scratch file %s: %w", scratch, rerr)
+	}
+	return err
 }
 
 func (e *Extractor) extractSolidStream(r io.Reader, eb *entryBudget, ctx context.Context) error {
@@ -941,7 +1063,10 @@ func (e *Extractor) extractSolidStream(r io.Reader, eb *entryBudget, ctx context
 			return err
 		}
 
-		name := string(filenameBuf)
+		// A solid archive's inner entries are read from their own local
+		// headers rather than from the reader's central directory, so the
+		// mapping the reader applies to a name has to be applied here too.
+		name := decodeUTF8OrMap(filenameBuf)
 		if method != Store || (uncompSize == 0 && flags&0x8 != 0) {
 			return fmt.Errorf("zip: sequential extraction not supported for method %d with flags %x", method, flags)
 		}
@@ -1101,8 +1226,7 @@ func (e *Extractor) extractSolidStream(r io.Reader, eb *entryBudget, ctx context
 			}
 
 			if e.options.safeWrites {
-				if rerr := os.Rename(writePath, path); rerr != nil {
-					os.Remove(writePath)
+				if rerr := e.finishSafeWrite(writePath, path); rerr != nil {
 					return rerr
 				}
 			}
@@ -1199,7 +1323,11 @@ func (e *Extractor) createLink(path string, file *File, budget *extractBudget) e
 			return err
 		}
 
-		target := string(name)
+		// The target is the entry's body, so it arrives as bytes and takes
+		// the same spelling every name takes before it goes to the
+		// filesystem -- otherwise it names the file by bytes that were never
+		// written on the platforms that cannot store them.
+		target := osRawBytes(name)
 		if isAbsArchiveTarget(target) {
 			return fmt.Errorf("zip: absolute symlink target not allowed: %s", target)
 		}
@@ -1283,15 +1411,16 @@ func (e *Extractor) createFile(ctx context.Context, path string, file *File, bud
 	}
 
 	cleanup := true
+	closed := false
+	// The net for every path out of this function that is not the ordinary
+	// one: the file is finished by hand at the end, because the move that
+	// follows it cannot be done while the handle is still open.
 	defer func() {
-		if err == nil {
-			if currentOffset, serr := f.Seek(0, io.SeekCurrent); serr == nil {
-				f.Truncate(currentOffset)
-			}
+		if !closed {
+			dclose(f, &err)
 		}
-		dclose(f, &err)
 		if err != nil && cleanup && !e.options.keepBroken {
-			os.Remove(writePath)
+			os.Remove(fixOSPath(writePath))
 		}
 	}()
 
@@ -1352,19 +1481,53 @@ func (e *Extractor) createFile(ctx context.Context, path string, file *File, bud
 		}
 	}
 
+	// Finishing the file has an order and it is this one: cut it back to
+	// what was written, let the handle go, and only then move it into
+	// place. Windows will not rename a file that is still open, and the
+	// rename used to be done from here with the close still deferred, so
+	// safeWrites failed on every entry of every archive there -- and the
+	// sweep of the temporary file, being in the same deferred call, failed
+	// with it and left the file behind as well.
+	if err == nil {
+		if currentOffset, serr := f.Seek(0, io.SeekCurrent); serr == nil {
+			f.Truncate(currentOffset)
+		}
+	}
+	dclose(f, &err)
+	closed = true
+
+	if err == nil && e.options.safeWrites {
+		err = e.finishSafeWrite(writePath, path)
+	}
 	if err == nil {
 		cleanup = false
 	}
+	// Counted after the move, not before it: an entry that was written and
+	// then failed to be put where it belongs has not been extracted.
 	incOnSuccess(&e.entries, err)
 
-	if err == nil && e.options.safeWrites {
-		if rerr := os.Rename(writePath, path); rerr != nil {
-			os.Remove(writePath)
-			return rerr
-		}
-	}
-
 	return err
+}
+
+// rename is os.Rename, named here so that a test can make the move fail. It
+// is the one step of an extraction with nothing of its own left to go wrong
+// by the time it runs.
+var rename = os.Rename
+
+// finishSafeWrite moves the temporary file an entry was written to onto the
+// name the archive gave it. Both paths go through fixOSPath: on Windows a
+// name ending in a dot or a space, or one longer than MAX_PATH, is only
+// reachable in its extended form, and moving without it would put the file
+// under a different name than the one everything else in the extraction used.
+func (e *Extractor) finishSafeWrite(writePath, path string) error {
+	if rerr := rename(fixOSPath(writePath), fixOSPath(path)); rerr != nil {
+		// The move is the error being returned; the temporary file it
+		// left behind is swept up. The handle is closed by now, so this
+		// removal works on Windows too.
+		os.Remove(fixOSPath(writePath))
+		return rerr
+	}
+	return nil
 }
 
 func (e *Extractor) updateFileMetadata(path string, file *File) error {
@@ -1385,10 +1548,6 @@ func (e *Extractor) updateFileMetadata(path string, file *File) error {
 	// Apply Windows ACL if present
 	if len(file.Acl) > 0 {
 		applyNtfsAclFunc(path, file.Acl)
-	}
-
-	if strings.Contains(file.Name, MappedStringMarkStr) {
-		path = filepath.Join(filepath.Dir(path), string(encodeMappedString(file.Name)))
 	}
 
 	if e.options.xattrs {
@@ -1418,9 +1577,7 @@ func (e *Extractor) absPath(name string) (string, error) {
 	// entry that names the extraction root itself is the one harmless way to
 	// clean to ".": it goes to MkdirAll, which has nothing left to do.
 	isDirEntry := strings.HasSuffix(name, "/") || strings.HasSuffix(name, `\`)
-	if strings.Contains(name, MappedStringMarkStr) {
-		name = string(encodeMappedString(name))
-	}
+	name = osFileName(name)
 	cleanName := filepath.ToSlash(filepath.Clean(name))
 	// filepath.Clean answers ".." with itself, which has neither a "../"
 	// prefix nor a "/" one, so a bare ".." resolved to the parent of the

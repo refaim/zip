@@ -504,14 +504,34 @@ func (a *Archiver) Archive(ctx context.Context, files map[string]os.FileInfo) (e
 		defer dclose(fp, &err)
 	}
 
+	// Каждый воркер сидит в `for task := range taskCh`, и выйти из него
+	// может только закрытие канала.
+	//
+	// Closing it once, from the deferred call that waits on the workers,
+	// covers every way out of this function. Closing it at the bottom
+	// instead did not: a worker that fails cancels the context, the sends
+	// below then take their `case <-ctx.Done()` and return from the middle
+	// of the loop, and any worker that happened to be idle at that moment
+	// stayed parked on the channel with nothing left to close it -- the
+	// deferred Wait then waited forever. It needs more workers than tasks in
+	// flight when the first error lands, so it never showed up in a case
+	// where every task fails.
+	var taskCh chan func() error
+	var closeTasksOnce sync.Once
+	closeTasks := func() {
+		if taskCh != nil {
+			closeTasksOnce.Do(func() { close(taskCh) })
+		}
+	}
+
 	wg, ctx := errgroup.WithContext(ctx)
 	defer func() {
+		closeTasks()
 		if werr := wg.Wait(); werr != nil {
 			err = werr
 		}
 	}()
 
-	var taskCh chan func() error
 	if fp != nil && concurrency > 1 {
 		taskCh = make(chan func() error, concurrency*2)
 		for i := 0; i < concurrency; i++ {
@@ -680,9 +700,7 @@ func (a *Archiver) Archive(ctx context.Context, files map[string]os.FileInfo) (e
 		}
 	}
 
-	if taskCh != nil {
-		close(taskCh)
-	}
+	closeTasks()
 
 	return wg.Wait()
 }

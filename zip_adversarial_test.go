@@ -209,7 +209,7 @@ func TestReader_RejectsHeaderOffsetAboveMaxInt64(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer f.Close()
+	closeAt(t, f)
 	if _, err := NewUpdater(f); !errors.Is(err, ErrFormat) {
 		t.Fatalf("updating an archive whose local header offset is 1<<63: got %v, want ErrFormat", err)
 	}
@@ -616,7 +616,7 @@ func extractArchiveTo(t *testing.T, raw []byte, opts ...ExtractorOption) (*Extra
 	if err != nil {
 		t.Fatalf("building the extractor: %v", err)
 	}
-	t.Cleanup(func() { e.Close() })
+	closeAt(t, e)
 	return e, dst, e.Extract(context.Background())
 }
 
@@ -1033,7 +1033,7 @@ func TestExtractor_ZeroCompressedSizeCannotProduceBytes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer e.Close()
+	closeAt(t, e)
 	e.zr.RegisterDecompressor(method, func(r io.Reader) io.ReadCloser {
 		return io.NopCloser(bytes.NewReader(make([]byte, 4096)))
 	})
@@ -1061,7 +1061,7 @@ func TestCopySparseZip_Budget(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer f.Close()
+			closeAt(t, f)
 
 			var written int64
 			b := newExtractBudget(&extractorOptions{maxFileSize: 1024}, &written)

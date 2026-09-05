@@ -119,27 +119,35 @@ func TestSysOther_Zip(t *testing.T) {
 
 	// Вызов функций с пустыми путями может вернуть ошибку ОС,
 	// но наша цель здесь — покрытие кода без паники.
-	_ = extractSpecialFile("", fh)
-	_ = sysXattrs("", fh)
-	_ = applyXattrs("", fh)
+	if err := extractSpecialFile("", fh); err != nil {
+		t.Logf("extractSpecialFile: %v", err)
+	}
+	if err := sysXattrs("", fh); err != nil {
+		t.Logf("sysXattrs: %v", err)
+	}
+	if err := applyXattrs("", fh); err != nil {
+		t.Logf("applyXattrs: %v", err)
+	}
 }
 
 func TestReader_InsecurePath_Edge(t *testing.T) {
+	savedDisableInsecurePaths := DisableInsecurePaths
 	DisableInsecurePaths = true
-	defer func() { DisableInsecurePaths = false }()
+	t.Cleanup(func() { DisableInsecurePaths = savedDisableInsecurePaths })
 
 	// 1. Создаем валидный ZIP в памяти с "плохим" путем
 	buf := new(bytes.Buffer)
 	zw := NewWriter(buf)
-	_, _ = zw.Create("../evil.txt")
-	zw.Close()
+	mustCreate(t, zw, "../evil.txt")
+	if err := zw.Close(); err != nil {
+		t.Fatalf("close writer: %v", err)
+	}
 
 	// 2. Пытаемся открыть его через NewReader.
 	// Это вызовет init() и должно вернуть ErrInsecurePath.
 	_, err := NewReader(bytes.NewReader(buf.Bytes()), int64(buf.Len()))
 
-	if err == nil {
-		// В некоторых конфигурациях filepath.IsLocal может вести себя иначе,
-		// но для покрытия кода этого вызова достаточно.
+	if !errors.Is(err, ErrInsecurePath) {
+		t.Fatalf("NewReader on an entry named %q = %v, want ErrInsecurePath", "../evil.txt", err)
 	}
 }

@@ -28,8 +28,10 @@ func TestWriter_NtfsAclIntegration(t *testing.T) {
 		Name: "acl.txt",
 		Acl:  acl,
 	}
-	zw.CreateHeader(fh)
-	zw.Close()
+	mustCreateHeader(t, zw, fh)
+	if err := zw.Close(); err != nil {
+		t.Fatalf("close writer: %v", err)
+	}
 
 	zr, _ := NewReader(bytes.NewReader(buf.Bytes()), int64(buf.Len()))
 	if !bytes.Equal(zr.File[0].Acl, acl) {
@@ -117,21 +119,23 @@ func TestNtfsAclAndAds_Mocked(t *testing.T) {
 
 	tmp := t.TempDir()
 	filePath := filepath.Join(tmp, "test_file.txt")
-	os.WriteFile(filePath, []byte("some content"), 0644)
+	mustWriteFile(t, filePath, []byte("some content"), 0644)
 
-	os.WriteFile(filePath+":Zone.Identifier", []byte("zone data"), 0644)
-	os.WriteFile(filePath+":custom_stream", []byte("custom data"), 0644)
+	mustWriteFile(t, filePath+":Zone.Identifier", []byte("zone data"), 0644)
+	mustWriteFile(t, filePath+":custom_stream", []byte("custom data"), 0644)
 
 	zipPath := filepath.Join(tmp, "archive.zip")
 	f, err := os.Create(zipPath)
 	if err != nil {
 		t.Fatal(err)
 	}
+	closeAt(t, f)
 
 	a, err := NewArchiver(f, tmp, WithArchiverXattrs(true))
 	if err != nil {
 		t.Fatal(err)
 	}
+	closeAt(t, a)
 
 	info, _ := os.Stat(filePath)
 	files := map[string]os.FileInfo{filePath: info}
@@ -140,20 +144,27 @@ func TestNtfsAclAndAds_Mocked(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Archiving with mocks failed: %v", err)
 	}
-	a.Close()
-	f.Close()
+	if err := a.Close(); err != nil {
+		t.Fatalf("close archiver: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close %s: %v", zipPath, err)
+	}
 
 	dstDir := filepath.Join(tmp, "extracted")
 	e, err := NewExtractor(zipPath, dstDir, WithExtractorXattrs(true))
 	if err != nil {
 		t.Fatal(err)
 	}
+	closeAt(t, e)
 
 	err = e.Extract(context.Background())
 	if err != nil {
 		t.Fatalf("Extraction with mocks failed: %v", err)
 	}
-	e.Close()
+	if err := e.Close(); err != nil {
+		t.Fatalf("close extractor: %v", err)
+	}
 
 	if !bytes.Equal(appliedAcl, mockAcl) {
 		t.Errorf("expected applied ACL %q, got %q", string(mockAcl), string(appliedAcl))

@@ -41,7 +41,7 @@ func TestDeflate64Encoder_Roundtrip(t *testing.T) {
 
 	// 2. Decompress using our Deflate64 decoder
 	decoder := decodeDeflate64(compressedBuf)
-	defer decoder.Close()
+	closeAt(t, decoder)
 
 	decompressedData, err := io.ReadAll(decoder)
 	if err != nil {
@@ -63,7 +63,7 @@ func TestDeflate64Encoder_Empty(t *testing.T) {
 	}
 
 	decoder := decodeDeflate64(buf)
-	defer decoder.Close()
+	closeAt(t, decoder)
 
 	data, err := io.ReadAll(decoder)
 	if err != nil {
@@ -94,6 +94,7 @@ func TestDeflate64_External7zBidirectional(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	closeAt(t, f)
 	zw := NewWriter(f)
 	w, err := zw.CreateHeader(&FileHeader{
 		Name:   "test.txt",
@@ -102,9 +103,13 @@ func TestDeflate64_External7zBidirectional(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	w.Write(srcData)
-	zw.Close()
-	f.Close()
+	mustWrite(t, w, srcData)
+	if err := zw.Close(); err != nil {
+		t.Fatalf("Writer close failed: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close %s: %v", zipPath, err)
+	}
 
 	extractedDir := filepath.Join(tmpDir, "7z_extracted")
 	cmd := exec.Command(p7zPath, "x", "-o"+extractedDir, zipPath)
@@ -134,10 +139,12 @@ func TestDeflate64_ExtremeAllZeros(t *testing.T) {
 	if n != len(srcData) {
 		t.Fatalf("Expected %d bytes written, got %d", len(srcData), n)
 	}
-	encoder.Close()
+	if err := encoder.Close(); err != nil {
+		t.Fatalf("Encoder close failed: %v", err)
+	}
 
 	decoder := decodeDeflate64(buf)
-	defer decoder.Close()
+	closeAt(t, decoder)
 
 	decompressed, err := io.ReadAll(decoder)
 	if err != nil {
@@ -164,11 +171,13 @@ func TestDeflate64_BoundaryDistances(t *testing.T) {
 
 	buf := new(bytes.Buffer)
 	encoder := newDeflate64Writer(buf)
-	encoder.Write(srcData)
-	encoder.Close()
+	mustWrite(t, encoder, srcData)
+	if err := encoder.Close(); err != nil {
+		t.Fatalf("Encoder close failed: %v", err)
+	}
 
 	decoder := decodeDeflate64(buf)
-	defer decoder.Close()
+	closeAt(t, decoder)
 
 	decompressed, err := io.ReadAll(decoder)
 	if err != nil {

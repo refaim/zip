@@ -42,10 +42,6 @@ jobs:
         # compiles the platform files (fs_*.go, sys_*.go, register_ppmd*.go)
         # and vets them without running them.
         #
-        # windows-* and macos-* are not here yet. The suite is red on both, for
-        # reasons that are defects in the package rather than in the runners,
-        # and each cell is enabled in the change that fixes what makes it red.
-        #
         # linux/386 is the one cell that is not the runner's own architecture.
         # It runs there because a 32-bit int is a different int: the package
         # reads counts and lengths out of archives and computes with them, and
@@ -56,9 +52,12 @@ jobs:
         # arithmetic is. The binaries are static and pure Go, so an amd64
         # runner executes them as they are.
         include:
-          - { os: ubuntu-latest,    target: linux/amd64, goarch: amd64 }
-          - { os: ubuntu-latest,    target: linux/386,   goarch: "386" }
-          - { os: ubuntu-24.04-arm, target: linux/arm64, goarch: arm64 }
+          - { os: ubuntu-latest,    target: linux/amd64,   goarch: amd64 }
+          - { os: ubuntu-latest,    target: linux/386,     goarch: "386" }
+          - { os: ubuntu-24.04-arm, target: linux/arm64,   goarch: arm64 }
+          - { os: windows-latest,   target: windows/amd64, goarch: amd64 }
+          - { os: macos-latest,     target: darwin/arm64,  goarch: arm64 }
+          - { os: macos-15-intel,   target: darwin/amd64,  goarch: amd64 }
     env:
       # The package is pure Go. Pinning this keeps every runner on the same
       # configuration instead of letting each one decide by whether it happens

@@ -28,8 +28,10 @@ func TestWriter_ZIP64Forced(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wr.Write([]byte("fake data"))
-	w.Close()
+	mustWrite(t, wr, []byte("fake data"))
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
 
 	// Now read and check that the zip64 flag was set
 	zr, err := NewReader(bytes.NewReader(buf.Bytes()), int64(buf.Len()))
@@ -60,8 +62,10 @@ func TestWriter_ZIP64LocalHeaderExtra(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wr.Write([]byte("fake data"))
-	w.Close()
+	mustWrite(t, wr, []byte("fake data"))
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
 
 	raw := buf.Bytes()
 	if !bytes.Equal(raw[:4], []byte{0x50, 0x4b, 0x03, 0x04}) {
@@ -110,7 +114,7 @@ func TestWriter_ZIP64LargeCount(t *testing.T) {
 	// Simulate a situation where there are more than 65535 files (uint16 limit)
 	// To save time and memory, we will modify the counter directly in the test
 	for i := 0; i < 10; i++ {
-		w.Create(fmt.Sprintf("file_%d.txt", i))
+		mustCreate(t, w, fmt.Sprintf("file_%d.txt", i))
 	}
 
 	// Hack for the test: substitute the number of records before closing
@@ -160,7 +164,7 @@ func TestWriter_SetOffsetPanic(t *testing.T) {
 		}
 	}()
 	w := NewWriter(new(bytes.Buffer))
-	w.Create("test.txt")
+	mustCreate(t, w, "test.txt")
 	w.SetOffset(100) // Should cause a panic
 }
 
@@ -175,7 +179,7 @@ func TestWriter_LongCommentError(t *testing.T) {
 
 func TestWriter_AddFS(t *testing.T) {
 	tmp := t.TempDir()
-	os.WriteFile(filepath.Join(tmp, "fs.txt"), []byte("fs data"), 0644)
+	mustWriteFile(t, filepath.Join(tmp, "fs.txt"), []byte("fs data"), 0644)
 
 	buf := new(bytes.Buffer)
 	w := NewWriter(buf)
@@ -185,7 +189,9 @@ func TestWriter_AddFS(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AddFS failed: %v", err)
 	}
-	w.Close()
+	if err := w.Close(); err != nil {
+		t.Fatalf("close writer: %v", err)
+	}
 
 	zr, _ := NewReader(bytes.NewReader(buf.Bytes()), int64(buf.Len()))
 	if len(zr.File) != 1 || zr.File[0].Name != "fs.txt" {
@@ -217,9 +223,11 @@ func TestWriter_AutoExtrasInjection(t *testing.T) {
 		OwnerSet: true,
 	}
 
-	w, _ := zw.CreateHeader(fh)
-	w.Write([]byte("metadata test"))
-	zw.Close()
+	w := mustCreateHeader(t, zw, fh)
+	mustWrite(t, w, []byte("metadata test"))
+	if err := zw.Close(); err != nil {
+		t.Fatalf("close writer: %v", err)
+	}
 
 	zr, _ := NewReader(bytes.NewReader(buf.Bytes()), int64(buf.Len()))
 	f := zr.File[0]
@@ -254,8 +262,10 @@ func TestWriter_MetadataIdempotency(t *testing.T) {
 	// First Call (via Creation)
 	buf := new(bytes.Buffer)
 	zw := NewWriter(buf)
-	zw.CreateHeader(fh)
-	zw.Close()
+	mustCreateHeader(t, zw, fh)
+	if err := zw.Close(); err != nil {
+		t.Fatalf("close writer: %v", err)
+	}
 
 	initialExtraLen := len(fh.Extra)
 
@@ -274,9 +284,11 @@ func TestWriter_CDE(t *testing.T) {
 	// 1. Create an archive with an encrypted central directory
 	zw := NewWriter(buf)
 	zw.SetEncryptCentralDirectory(true, password)
-	w, _ := zw.Create("hidden.txt")
-	w.Write([]byte("can you see me?"))
-	zw.Close()
+	w := mustCreate(t, zw, "hidden.txt")
+	mustWrite(t, w, []byte("can you see me?"))
+	if err := zw.Close(); err != nil {
+		t.Fatalf("close writer: %v", err)
+	}
 
 	raw := buf.Bytes()
 
@@ -317,9 +329,11 @@ func TestWriter_StreamingForced(t *testing.T) {
 
 	fh := &FileHeader{Name: "stream.txt", Method: Store}
 	// Even for a Store, we can force a descriptor if we want absolute streaming.
-	w, _ := zw.CreateHeader(fh)
-	w.Write([]byte("streaming data"))
-	zw.Close()
+	w := mustCreateHeader(t, zw, fh)
+	mustWrite(t, w, []byte("streaming data"))
+	if err := zw.Close(); err != nil {
+		t.Fatalf("close writer: %v", err)
+	}
 
 	// We verify that flag 0x8 (Data Descriptor) is set.
 	zr, _ := NewReader(bytes.NewReader(buf.Bytes()), int64(buf.Len()))

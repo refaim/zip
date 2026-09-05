@@ -49,7 +49,7 @@ func TestDeflate64_External7z(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to open generated zip: %v", err)
 	}
-	defer zr.Close()
+	closeAt(t, zr)
 
 	if len(zr.File) == 0 {
 		t.Fatal("no files in the zip archive")
@@ -64,7 +64,7 @@ func TestDeflate64_External7z(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to open file inside zip: %v", err)
 	}
-	defer rc.Close()
+	closeAt(t, rc)
 
 	decompressed, err := io.ReadAll(rc)
 	if err != nil {

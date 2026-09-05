@@ -27,7 +27,9 @@ func TestLZMA_Writer_Roundtrip(t *testing.T) {
 	if _, err := w.Write(data); err != nil {
 		t.Fatalf("Failed to write LZMA data: %v", err)
 	}
-	zw.Close()
+	if err := zw.Close(); err != nil {
+		t.Fatalf("Failed to close LZMA writer: %v", err)
+	}
 
 	// Read back
 	zr, err := NewReader(bytes.NewReader(buf.Bytes()), int64(buf.Len()))
@@ -48,7 +50,7 @@ func TestLZMA_Writer_Roundtrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to open LZMA file: %v", err)
 	}
-	defer rc.Close()
+	closeAt(t, rc)
 
 	decompressed, err := io.ReadAll(rc)
 	if err != nil {

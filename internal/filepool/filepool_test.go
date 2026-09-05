@@ -29,7 +29,9 @@ func TestFilePool_Basic(t *testing.T) {
 		t.Errorf("Expected 10 written bytes, got %d", f1.Written())
 	}
 
-	f1.Hasher().Write([]byte("hello pool"))
+	if _, err := f1.Hasher().Write([]byte("hello pool")); err != nil {
+		t.Fatalf("Failed to write to the pool file's hasher: %v", err)
+	}
 	if f1.Checksum() == 0 {
 		t.Error("Expected non-zero checksum")
 	}
@@ -73,7 +75,15 @@ func TestFilePool_WritePastBuffer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer fp.Close()
+	// The pool owns the temp file the write below forces it to create, and
+	// this is the only close of it: a t.Fatal in the middle would otherwise
+	// leave the handle open across the removal of tmpDir. The helpers of
+	// package zip are not visible here, so the net is spelled out.
+	t.Cleanup(func() {
+		if err := fp.Close(); err != nil {
+			t.Errorf("Failed to close file pool: %v", err)
+		}
+	})
 
 	f := fp.Get()
 	defer fp.Put(f)
@@ -135,9 +145,20 @@ func TestFilePool_CleanupOnClose(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The test closes the pool itself below -- that close is what it asserts
+	// on. This is only the net for the physical file the write creates, so
+	// that a t.Fatal before that point still releases it; closing an already
+	// closed pool is a no-op.
+	t.Cleanup(func() {
+		if err := fp.Close(); err != nil {
+			t.Errorf("Failed to close file pool: %v", err)
+		}
+	})
 
 	f := fp.Get()
-	f.Write([]byte("exceed buffer size to create physical file"))
+	if _, err := f.Write([]byte("exceed buffer size to create physical file")); err != nil {
+		t.Fatalf("Write failed: %v", err)
+	}
 
 	physicalName := f.f.Name()
 	if _, err := os.Stat(physicalName); os.IsNotExist(err) {

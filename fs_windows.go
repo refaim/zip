@@ -274,3 +274,14 @@ func preallocate(f *os.File, size int64) error {
 	// 2. Set logical end-of-file (EOF)
 	return f.Truncate(size)
 }
+
+// removeHeldElsewhere reports whether err is Windows refusing to unlink a file
+// because another process still has it open: a file just written and not yet
+// let go of, which is what a scanner reading everything that lands on disk
+// leaves behind for a moment. ERROR_ACCESS_DENIED is the coarser of the two
+// and also answers for a read-only file, which no amount of waiting changes;
+// waiting for it anyway costs a second on a path that is failing regardless,
+// and is what testing's own temp directory cleanup does for the same reason.
+func removeHeldElsewhere(err error) bool {
+	return errors.Is(err, windows.ERROR_SHARING_VIOLATION) || errors.Is(err, windows.ERROR_ACCESS_DENIED)
+}
