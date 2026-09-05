@@ -329,8 +329,12 @@ func TestPPMd_MemoryLimit(t *testing.T) {
 	}
 	buf := make([]byte, 10)
 	_, err := rc.Read(buf)
-	if err == nil || !strings.Contains(err.Error(), "PPMd memory limit exceeded") {
-		t.Errorf("expected PPMd memory limit error, got: %v", err)
+	// A build with no PPMd at all refuses the header outright, which is the
+	// same answer to the same question: the memory it asks for is not
+	// granted.
+	if err == nil || !(strings.Contains(err.Error(), "PPMd memory limit exceeded") ||
+		strings.Contains(err.Error(), "PPMd compression is not supported")) {
+		t.Errorf("expected the PPMd memory request to be refused, got: %v", err)
 	}
 }
 

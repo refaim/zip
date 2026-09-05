@@ -1,0 +1,240 @@
+name: CI
+
+on:
+  # Branches only. A release tag points at a commit the branch push has
+  # already built, so an unfiltered `push` fans that one commit out into two
+  # independent runs of the whole matrix, and concurrency cannot fold them
+  # together because the group keys on the ref. '**' matches every branch,
+  # slashes included, and no tag at all.
+  push:
+    branches: ['**']
+  pull_request:
+
+# Nothing in this workflow writes anything back: every job checks the tree out,
+# builds it and runs it. Naming read here keeps a token that could push, tag or
+# comment out of every step, whatever the repository or the organisation hands
+# out by default.
+permissions:
+  contents: read
+
+# A push fans out into dozens of checks, and only the latest queued run for a
+# branch and event is useful. Preserve every main run: its history must never
+# be interrupted.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  test:
+    name: Test (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    # Every job carries a bound of its own. The default is six hours, which is
+    # not a timeout so much as a way to hold a runner all morning: a hang here
+    # is a bug in the suite, and the go test -timeout inside the step only
+    # covers a hang in a test, not one in checkout, in the toolchain download
+    # or in the compile.
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # Runtime coverage is deliberately narrower than the platform reach of
+        # the package. Every other GOOS lives in the build matrix below, which
+        # compiles the platform files (fs_*.go, sys_*.go, register_ppmd*.go)
+        # and vets them without running them.
+        #
+        # windows-* and macos-* are not here yet. The suite is red on both, for
+        # reasons that are defects in the package rather than in the runners,
+        # and each cell is enabled in the change that fixes what makes it red.
+        #
+        # linux/386 is the one cell that is not the runner's own architecture.
+        # It runs there because a 32-bit int is a different int: the package
+        # reads counts and lengths out of archives and computes with them, and
+        # a product that is comfortably inside an int64 wraps in an int32,
+        # which is a bounds check that passes for a buffer that cannot hold
+        # what it just allowed. Nothing about that shows up on a 64-bit cell,
+        # and the build matrix only compiles 386, which is not where the
+        # arithmetic is. The binaries are static and pure Go, so an amd64
+        # runner executes them as they are.
+        include:
+          - { os: ubuntu-latest,    target: linux/amd64, goarch: amd64 }
+          - { os: ubuntu-latest,    target: linux/386,   goarch: "386" }
+          - { os: ubuntu-24.04-arm, target: linux/arm64, goarch: arm64 }
+    env:
+      # The package is pure Go. Pinning this keeps every runner on the same
+      # configuration instead of letting each one decide by whether it happens
+      # to ship a C toolchain.
+      CGO_ENABLED: 0
+      # Named for every cell rather than only the one that differs, so a cell
+      # never inherits an architecture from the runner it happens to land on.
+      GOARCH: ${{ matrix.goarch }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+
+      # -shuffle=on on every cell, not just the ones where an ordering bug has
+      # already bitten: order independence is a property of the suite. The
+      # seed is printed as `-test.shuffle N`, so any failure here reproduces
+      # locally with -shuffle=N.
+      - name: Test
+        run: go test -count=1 -shuffle=on -timeout 10m ./...
+
+  race:
+    name: Race
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # The rest of this workflow intentionally keeps cgo disabled. Enabling
+      # it here does not reverse that decision: the race detector requires it.
+      CGO_ENABLED: 1
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+
+      # -shuffle=on here too: order independence is a property of the suite,
+      # and this cell is the one that runs it with the detector attached.
+      - run: go test -race -count=1 -shuffle=on -timeout 20m ./...
+
+  formatting:
+    name: Formatting
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      CGO_ENABLED: 0
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+
+      - name: Check gofmt
+        run: |
+          if [ -n "$(gofmt -s -l .)" ]; then
+            echo "The following files are not gofmt-clean:"
+            gofmt -s -l .
+            echo
+            echo "Run 'gofmt -s -w .' to fix."
+            exit 1
+          fi
+
+  vulnerabilities:
+    name: Vulnerabilities
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      CGO_ENABLED: 0
+    steps:
+      - uses: actions/checkout@v4
+
+      # go.mod sets the minimum language version, while govulncheck checks the
+      # standard library used for the build, so CI needs the latest patch.
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+
+      - run: go run golang.org/x/vuln/cmd/govulncheck@v1.7.0 ./...
+
+  workflows:
+    name: Workflows
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      CGO_ENABLED: 0
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+
+      - run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 .github/workflows/*.yml
+
+  build:
+    name: Build (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # The package compiles for every GOOS with a POSIX-ish syscall surface
+        # plus Windows: fs_windows.go and sys_windows.go cover Windows,
+        # fs_linux.go and sys_linux.go cover Linux, sys_darwin.go and
+        # sys_freebsd.go cover those two, and fs_unix.go, sys_other.go and
+        # fs_prealloc_fallback.go catch everything else. js, wasip1 and plan9
+        # are absent on purpose: fs_unix.go reaches for Fchmodat and
+        # AT_SYMLINK_NOFOLLOW, which x/sys/unix does not define there.
+        #
+        # The architecture spread is not decoration. register_ppmd.go builds
+        # only on amd64, arm64, s390x, ppc64le and riscv64 while
+        # register_ppmd_stub.go takes over elsewhere, and the Linux device
+        # metadata code is written twice, once per dev_t width.
+        #
+        # The pairs are batched three ways rather than run one job apiece.
+        # Compiling this package for one target takes seven to ten seconds
+        # while a runner needs thirty to sixty just to start and install Go,
+        # so a job per pair spends most of its life on overhead and 32 of them
+        # do not fit the concurrency limit in one wave.
+        include:
+          - name: linux
+            targets: >-
+              linux/amd64 linux/arm64 linux/arm linux/386
+              linux/riscv64 linux/ppc64le linux/s390x linux/mips64le
+          - name: windows, darwin, android
+            targets: >-
+              windows/amd64 windows/arm64 windows/386
+              darwin/amd64 darwin/arm64 android/arm64
+          - name: bsd, illumos, solaris, aix
+            targets: >-
+              freebsd/amd64 freebsd/arm64 netbsd/amd64 openbsd/amd64
+              dragonfly/amd64 illumos/amd64 solaris/amd64 aix/ppc64
+    env:
+      CGO_ENABLED: 0
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+
+      # Every target in the batch reports, so one failure does not hide the
+      # rest: the loop records what failed and the job fails once at the end,
+      # with an annotation naming the pairs the job name no longer names.
+      #
+      # `go vet` type-checks the test files too, and unix_advanced_test.go
+      # calls unix.Setxattr, which x/sys/unix leaves undefined on openbsd,
+      # dragonfly, illumos, solaris and aix. Those five are built but not
+      # vetted; vetting is not the platform claim this job makes.
+      - name: Build and vet
+        env:
+          TARGETS: ${{ matrix.targets }}
+        run: |
+          failed=
+          for target in $TARGETS; do
+            GOOS=${target%/*}
+            GOARCH=${target#*/}
+            export GOOS GOARCH
+            echo "::group::$target"
+            go build ./... || failed="$failed $target(build)"
+            case "$GOOS" in
+              openbsd|dragonfly|illumos|solaris|aix)
+                echo "vet skipped: x/sys/unix defines no Setxattr on $GOOS"
+                ;;
+              *)
+                go vet ./... || failed="$failed $target(vet)"
+                ;;
+            esac
+            echo "::endgroup::"
+          done
+          if [ -n "$failed" ]; then
+            echo "::error::build or vet failed for:$failed"
+            exit 1
+          fi
