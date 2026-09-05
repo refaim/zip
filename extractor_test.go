@@ -3,6 +3,8 @@ package zip
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
+	"errors"
 	"fmt"
 	"hash/crc32"
 	"os"
@@ -1108,5 +1110,622 @@ func TestExtractor_WorkerPool_Cancellation(t *testing.T) {
 	err := e.Extract(ctx)
 	if err == nil || err != context.Canceled {
 		t.Errorf("expected context.Canceled, got %v", err)
+	}
+}
+
+func TestIsAbsArchiveTarget(t *testing.T) {
+	tests := []struct {
+		target string
+		want   bool
+	}{
+		{"", false},
+		{"target.txt", false},
+		{"sub/target.txt", false},
+		{`sub\target.txt`, false},
+		{"..", false},
+		{"../../etc/passwd", false},
+		{"a", false},
+		{"ab", false},
+		{"1:name", false},
+		{"::name", false},
+		{"/etc/passwd", true},
+		{"/", true},
+		{`\etc\passwd`, true},
+		{`\server\share\secret`, true},
+		{`\?\C:\Windows`, true},
+		{`C:\Windows\System32`, true},
+		{"c:/Windows/System32", true},
+		{"C:name", true},
+		{"Z:", true},
+	}
+
+	for _, tt := range tests {
+		if got := isAbsArchiveTarget(tt.target); got != tt.want {
+			t.Errorf("isAbsArchiveTarget(%q) = %v, want %v", tt.target, got, tt.want)
+		}
+	}
+}
+
+// TestExtractor_AbsoluteSymlinkTargetRejected checks the rejection on every
+// spelling of "absolute", not only the spelling the running OS recognises.
+// An archive records the paths the machine that wrote it saw, so a Unix
+// target can arrive on Windows and a drive-letter target can arrive on Unix;
+// filepath.IsAbs answers only for the platform it runs on, and so waves each
+// one through on exactly the platform it was aimed at.
+func TestExtractor_AbsoluteSymlinkTargetRejected(t *testing.T) {
+	targets := []string{
+		"/etc/passwd",
+		`\etc\passwd`,
+		`C:\Windows\System32\drivers\etc\hosts`,
+		"c:/Windows/System32",
+		`\server\share\secret`,
+	}
+
+	for _, target := range targets {
+		t.Run(target, func(t *testing.T) {
+			tmp := t.TempDir()
+			zipPath := filepath.Join(tmp, "sym.zip")
+			dstDir := filepath.Join(tmp, "safe")
+
+			f, err := os.Create(zipPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			zw := NewWriter(f)
+			fh := &FileHeader{Name: "attack_link"}
+			fh.SetMode(os.ModeSymlink)
+			w, err := zw.CreateHeader(fh)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := w.Write([]byte(target)); err != nil {
+				t.Fatal(err)
+			}
+			if err := zw.Close(); err != nil {
+				t.Fatal(err)
+			}
+			f.Close()
+
+			e, err := NewExtractor(zipPath, dstDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer e.Close()
+
+			err = e.Extract(context.Background())
+			if err == nil || !strings.Contains(err.Error(), "absolute symlink target not allowed") {
+				t.Errorf("expected %q to be rejected as absolute, got: %v", target, err)
+			}
+		})
+	}
+}
+
+// TestExtractor_HardLink covers the hard link branch of createLink on every
+// platform. An archive records a hard link as a regular entry carrying a
+// Linkname in its unix extra field, and nothing about reading that back is
+// Unix-specific: os.Link works on NTFS just as well, and an archive written
+// on one system is routinely extracted on another.
+func TestExtractor_HardLink(t *testing.T) {
+	tmp := t.TempDir()
+	zipPath := filepath.Join(tmp, "hardlink.zip")
+	dstDir := filepath.Join(tmp, "out")
+
+	f, err := os.Create(zipPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	zw := NewWriter(f)
+
+	target := &FileHeader{Name: "target.txt", Method: Store}
+	target.SetMode(0644)
+	w, err := zw.CreateHeader(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte("shared content")); err != nil {
+		t.Fatal(err)
+	}
+
+	link := &FileHeader{Name: "hard.txt", Method: Store, Linkname: "target.txt"}
+	link.SetMode(0644)
+	if _, err := zw.CreateHeader(link); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	e, err := NewExtractor(zipPath, dstDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	if err := e.Extract(context.Background()); err != nil {
+		t.Fatalf("extraction failed: %v", err)
+	}
+
+	for _, name := range []string{"target.txt", "hard.txt"} {
+		data, err := os.ReadFile(filepath.Join(dstDir, name))
+		if err != nil {
+			t.Fatalf("reading %s: %v", name, err)
+		}
+		if string(data) != "shared content" {
+			t.Errorf("%s = %q, want %q", name, data, "shared content")
+		}
+	}
+
+	// A hard link is one file under two names, so a write through one name is
+	// visible through the other. That holds on every filesystem this runs on
+	// and needs no platform-specific stat fields to check.
+	if err := os.WriteFile(filepath.Join(dstDir, "target.txt"), []byte("rewritten....."), 0644); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(dstDir, "hard.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "rewritten....." {
+		t.Errorf("hard.txt did not follow a write through target.txt: got %q", data)
+	}
+}
+
+// TestExtractor_RelativeSymlinkTargetResolvesAgainstTheLink pins the anchor a
+// relative link target is measured from.
+//
+// The chroot check resolves the target against the directory the link lives
+// in, which is what a symlink means. Everything the link is then made with
+// has to use that same anchor: on Windows a symlink needs a privilege the
+// extraction may not hold, so createWindowsSymlink falls back to a hard link
+// and then to copying the bytes, and both of those resolve a relative path
+// against the process working directory instead. That is a different
+// directory, chosen by whoever launched the program rather than by the check,
+// so the file the link ends up carrying is not the file the check approved --
+// and since the depth of the entry name is the archive's to choose, any
+// number of leading ".." survives the check and still climbs out of the
+// working directory.
+func TestExtractor_RelativeSymlinkTargetResolvesAgainstTheLink(t *testing.T) {
+	tmp := t.TempDir()
+
+	// "../data.txt" names this one from the working directory, and the one
+	// inside the destination from the link. Only the second is the archive's.
+	if err := os.WriteFile(filepath.Join(tmp, "data.txt"), []byte("WRONG"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cwd := filepath.Join(tmp, "cwd")
+	if err := os.MkdirAll(cwd, 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(cwd)
+
+	zipPath := filepath.Join(tmp, "link.zip")
+	dstDir := filepath.Join(tmp, "out")
+
+	f, err := os.Create(zipPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	zw := NewWriter(f)
+
+	data := &FileHeader{Name: "data.txt", Method: Store}
+	data.SetMode(0644)
+	w, err := zw.CreateHeader(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte("RIGHT")); err != nil {
+		t.Fatal(err)
+	}
+
+	dir := &FileHeader{Name: "sub/", Method: Store}
+	dir.SetMode(os.ModeDir | 0755)
+	if _, err := zw.CreateHeader(dir); err != nil {
+		t.Fatal(err)
+	}
+
+	link := &FileHeader{Name: "sub/link", Method: Store}
+	link.SetMode(os.ModeSymlink | 0777)
+	w, err = zw.CreateHeader(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte("../data.txt")); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	e, err := NewExtractor(zipPath, dstDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	if err := e.Extract(context.Background()); err != nil {
+		t.Fatalf("extraction failed: %v", err)
+	}
+
+	// Whether the entry became a symlink, a hard link or a copy, reading it
+	// has to hand back the file the archive pointed at.
+	got, err := os.ReadFile(filepath.Join(dstDir, "sub", "link"))
+	if err != nil {
+		t.Fatalf("reading the extracted link: %v", err)
+	}
+	if string(got) != "RIGHT" {
+		t.Errorf("the link carries %q, want %q -- it was resolved against the working directory", got, "RIGHT")
+	}
+}
+
+// TestExtractor_HardLinkTargetRejected covers the other half of createLink.
+// A hard link names its target relative to the extraction root, and nothing
+// checked that the name stayed there: filepath.Join cleans, so a leading ".."
+// ate the root and the link was made to a file outside it -- silently, and
+// with the metadata step then going on to chmod and chown that outside file
+// through the link it had just made.
+func TestExtractor_HardLinkTargetRejected(t *testing.T) {
+	tests := []struct {
+		target  string
+		wantErr string
+	}{
+		{"../outside_secret.txt", ErrInsecurePath.Error()},
+		{"a/../../outside_secret.txt", ErrInsecurePath.Error()},
+		// filepath.Clean answers ".." with itself, which is neither a "../"
+		// prefix nor a "/" one, so a bare ".." used to resolve to the parent
+		// of the extraction directory with no error at all. "." is the same
+		// hole one step short: it names the extraction directory itself.
+		{"..", ErrInsecurePath.Error()},
+		{"a/..", ErrInsecurePath.Error()},
+		{".", ErrInsecurePath.Error()},
+		{"/etc/passwd", "absolute hard link target not allowed"},
+		{`\etc\passwd`, "absolute hard link target not allowed"},
+		{`C:\Windows\System32\drivers\etc\hosts`, "absolute hard link target not allowed"},
+		{"c:/Windows/System32/config/SAM", "absolute hard link target not allowed"},
+	}
+
+	for _, tt := range tests {
+		target := tt.target
+		t.Run(target, func(t *testing.T) {
+			tmp := t.TempDir()
+			zipPath := filepath.Join(tmp, "hard.zip")
+			dstDir := filepath.Join(tmp, "out")
+			if err := os.MkdirAll(dstDir, 0755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(tmp, "outside_secret.txt"), []byte("secret"), 0644); err != nil {
+				t.Fatal(err)
+			}
+
+			f, err := os.Create(zipPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			zw := NewWriter(f)
+			link := &FileHeader{Name: "stolen.txt", Method: Store, Linkname: target}
+			link.SetMode(0644)
+			if _, err := zw.CreateHeader(link); err != nil {
+				t.Fatal(err)
+			}
+			if err := zw.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if err := f.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			e, err := NewExtractor(zipPath, dstDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer e.Close()
+
+			err = e.Extract(context.Background())
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("extracting a hard link to %q: got %v, want an error containing %q", target, err, tt.wantErr)
+			}
+			if _, err := os.Lstat(filepath.Join(dstDir, "stolen.txt")); !os.IsNotExist(err) {
+				t.Errorf("a link was made anyway: Lstat says %v", err)
+			}
+		})
+	}
+}
+
+// TestExtractor_HardLinkToMissingTarget covers the report when the entry the
+// link names is not in the archive at all. A hard link cannot be dangling --
+// there is no such thing -- so there is nothing to make and nothing to do but
+// say so.
+func TestExtractor_HardLinkToMissingTarget(t *testing.T) {
+	tmp := t.TempDir()
+	zipPath := filepath.Join(tmp, "hard.zip")
+	dstDir := filepath.Join(tmp, "out")
+
+	f, err := os.Create(zipPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	zw := NewWriter(f)
+	link := &FileHeader{Name: "hard.txt", Method: Store, Linkname: "not_in_the_archive.txt"}
+	link.SetMode(0644)
+	if _, err := zw.CreateHeader(link); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	e, err := NewExtractor(zipPath, dstDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	if err := e.Extract(context.Background()); err == nil {
+		t.Fatal("expected a hard link to a missing target to be reported")
+	}
+}
+
+// TestExtractor_SymlinkCreationFailureIsReported covers the report when the
+// platform refuses to make the link. The two branches are refused in two
+// different ways, and neither is refused by accident.
+//
+// Unix takes any byte in a name and is perfectly happy with a link that points
+// at nothing, so what it will not take is a target longer than a path may be.
+// Windows is happy with that target too when the process holds the symlink
+// privilege, so it is refused on the path instead: the second link here goes
+// inside the first, which by the time the links are made is a file rather than
+// the directory its name suggests, and all three of the ways
+// createWindowsSymlink has of making an entry need that parent to be there.
+func TestExtractor_SymlinkCreationFailureIsReported(t *testing.T) {
+	type entry struct {
+		name string
+		body string
+		mode os.FileMode
+	}
+	entries := []entry{{"link", strings.Repeat("a", 5000), os.ModeSymlink | 0777}}
+	if runtime.GOOS == "windows" {
+		entries = []entry{
+			{"data.txt", "payload", 0644},
+			{"d", "data.txt", os.ModeSymlink | 0777},
+			{"d/link", "data.txt", os.ModeSymlink | 0777},
+		}
+	}
+
+	tmp := t.TempDir()
+	zipPath := filepath.Join(tmp, "sym.zip")
+	dstDir := filepath.Join(tmp, "out")
+
+	f, err := os.Create(zipPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	zw := NewWriter(f)
+	for _, ent := range entries {
+		fh := &FileHeader{Name: ent.name, Method: Store}
+		fh.SetMode(ent.mode)
+		w, err := zw.CreateHeader(fh)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := w.Write([]byte(ent.body)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	e, err := NewExtractor(zipPath, dstDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	if err := e.Extract(context.Background()); err == nil {
+		t.Fatal("expected the refused link to be reported")
+	}
+}
+
+// TestExtractor_EntryNamingTheDestinationRejected covers the other side of the
+// same hole in absPath, on an ordinary file entry rather than a link.
+//
+// A file entry whose name cleans to "." resolves to the extraction directory
+// itself, and createFile then does to it what it does to any destination it is
+// about to write: os.Remove, which takes an empty directory away, and then
+// OpenFile, which puts a regular file there. A fresh destination is empty, so
+// the extraction replaced the directory it was given with a file and reported
+// success. A directory entry naming the root is a different matter and stays
+// allowed: it goes to MkdirAll, which has nothing to do.
+func TestExtractor_EntryNamingTheDestinationRejected(t *testing.T) {
+	for _, name := range []string{".", "a/.."} {
+		t.Run(name, func(t *testing.T) {
+			tmp := t.TempDir()
+			zipPath := filepath.Join(tmp, "dot.zip")
+			dstDir := filepath.Join(tmp, "out")
+			if err := os.MkdirAll(dstDir, 0755); err != nil {
+				t.Fatal(err)
+			}
+
+			f, err := os.Create(zipPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			zw := NewWriter(f)
+			fh := &FileHeader{Name: name, Method: Store}
+			fh.SetMode(0644)
+			w, err := zw.CreateHeader(fh)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := w.Write([]byte("payload")); err != nil {
+				t.Fatal(err)
+			}
+			if err := zw.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if err := f.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			e, err := NewExtractor(zipPath, dstDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer e.Close()
+			if err := e.Extract(context.Background()); !errors.Is(err, ErrInsecurePath) {
+				t.Fatalf("extracting an entry named %q: got %v, want ErrInsecurePath", name, err)
+			}
+			fi, err := os.Lstat(dstDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !fi.IsDir() {
+				t.Errorf("the destination is now %v, not a directory", fi.Mode())
+			}
+		})
+	}
+}
+
+// TestExtractor_RootDirectoryEntryAllowed is the case the rule above must not
+// catch: an archive that carries "./" as an entry names the extraction
+// directory, which already exists and is meant to.
+func TestExtractor_RootDirectoryEntryAllowed(t *testing.T) {
+	tmp := t.TempDir()
+	zipPath := filepath.Join(tmp, "root.zip")
+	dstDir := filepath.Join(tmp, "out")
+
+	f, err := os.Create(zipPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	zw := NewWriter(f)
+	dir := &FileHeader{Name: "./", Method: Store}
+	dir.SetMode(os.ModeDir | 0755)
+	if _, err := zw.CreateHeader(dir); err != nil {
+		t.Fatal(err)
+	}
+	fh := &FileHeader{Name: "inside.txt", Method: Store}
+	fh.SetMode(0644)
+	w, err := zw.CreateHeader(fh)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte("payload")); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	e, err := NewExtractor(zipPath, dstDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	if err := e.Extract(context.Background()); err != nil {
+		t.Fatalf("extraction failed: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(dstDir, "inside.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "payload" {
+		t.Errorf("content = %q, want %q", data, "payload")
+	}
+}
+
+// TestExtractor_SymlinkBodyUnreadable covers what createLink reports when the
+// entry it has to read the target out of cannot be read.
+//
+// A symlink's target is the entry's body, so making the link means opening and
+// reading it like any other entry, and both of those can fail on an archive
+// that is damaged or built to be. The first case clobbers the local header
+// signature the open checks; the second leaves the header intact and destroys
+// the deflate stream behind it, which only the read can notice.
+func TestExtractor_SymlinkBodyUnreadable(t *testing.T) {
+	build := func(t *testing.T, method uint16, target string) []byte {
+		t.Helper()
+		var buf bytes.Buffer
+		zw := NewWriter(&buf)
+		fh := &FileHeader{Name: "link", Method: method}
+		fh.SetMode(os.ModeSymlink | 0777)
+		w, err := zw.CreateHeader(fh)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := w.Write([]byte(target)); err != nil {
+			t.Fatal(err)
+		}
+		if err := zw.Close(); err != nil {
+			t.Fatal(err)
+		}
+		return buf.Bytes()
+	}
+
+	tests := []struct {
+		name    string
+		archive func(t *testing.T) []byte
+	}{
+		{
+			name: "the local header is not one",
+			archive: func(t *testing.T) []byte {
+				raw := build(t, Store, "target.txt")
+				// The first entry's local header sits at offset zero, and its
+				// signature is the first thing findBodyOffset checks.
+				binary.LittleEndian.PutUint32(raw[0:4], 0xDEADBEEF)
+				return raw
+			},
+		},
+		{
+			name: "the body is not a deflate stream",
+			archive: func(t *testing.T) []byte {
+				raw := build(t, Deflate, strings.Repeat("target/", 512))
+				zr, err := NewReader(bytes.NewReader(raw), int64(len(raw)))
+				if err != nil {
+					t.Fatal(err)
+				}
+				off, err := zr.File[0].DataOffset()
+				if err != nil {
+					t.Fatal(err)
+				}
+				// 0xFF opens a block whose type is the one flate has no
+				// meaning for, so the very first read fails.
+				for i := off; i < off+int64(zr.File[0].CompressedSize64); i++ {
+					raw[i] = 0xFF
+				}
+				return raw
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tmp := t.TempDir()
+			zipPath := filepath.Join(tmp, "broken.zip")
+			if err := os.WriteFile(zipPath, tt.archive(t), 0644); err != nil {
+				t.Fatal(err)
+			}
+
+			e, err := NewExtractor(zipPath, filepath.Join(tmp, "out"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer e.Close()
+			if err := e.Extract(context.Background()); err == nil {
+				t.Fatal("expected the unreadable link body to be reported")
+			}
+		})
 	}
 }

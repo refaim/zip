@@ -107,6 +107,6 @@ func lookupGroup(name string) (int, error) {
 	resolveMut.Unlock()
 	return id, nil
 }
-func createWindowsSymlink(target, link string, isDir bool) error {
+func createWindowsSymlink(target, resolved, link string, isDir bool, eb *entryBudget) error {
 	return nil // No-op on Unix, never called due to runtime.GOOS check
 }

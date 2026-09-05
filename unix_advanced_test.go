@@ -311,3 +311,21 @@ func TestUnixOwnerStrings_Zip(t *testing.T) {
 		t.Errorf("Expected numeric UID/GID 9999/9999, got %d/%d", numericUid, numericGid)
 	}
 }
+
+// TestCreateWindowsSymlinkStub pins what the name means in a Unix build.
+//
+// createLink picks between os.Symlink and createWindowsSymlink at run time
+// rather than at build time, so the name has to resolve in every build. On
+// Unix the branch that calls it is never taken and the stub is what keeps the
+// package compiling; it is a no-op, and specifically it does not quietly make
+// something on a platform that has a real symlink to make instead.
+func TestCreateWindowsSymlinkStub(t *testing.T) {
+	tmp := t.TempDir()
+	link := filepath.Join(tmp, "link")
+	if err := createWindowsSymlink("target", filepath.Join(tmp, "target"), link, false, noLimitBudget("link")); err != nil {
+		t.Errorf("the Unix stub answered %v, want nil", err)
+	}
+	if _, err := os.Lstat(link); !os.IsNotExist(err) {
+		t.Errorf("the stub made something at %s: %v", link, err)
+	}
+}

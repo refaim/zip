@@ -147,7 +147,7 @@ func isAllZeros(p []byte) bool {
 	return len(p) == 1 || p[0] == p[1] && bytes.Equal(p[:len(p)-1], p[1:])
 }
 
-func copySparseZip(dst *os.File, src io.Reader, size uint64, written *int64, ctx context.Context) error {
+func copySparseZip(dst *os.File, src io.Reader, bw *budgetWriter, ctx context.Context) error {
 	buf := getSparseBuf()
 	defer putSparseBuf(buf)
 
@@ -159,18 +159,23 @@ func copySparseZip(dst *os.File, src io.Reader, size uint64, written *int64, ctx
 		n, err := src.Read(buf)
 		if n > 0 {
 			if isAllZeros(buf[:n]) {
+				// A hole is as much a part of the file as the bytes
+				// around it, so it is accounted for like them even
+				// though nothing is written.
+				if cErr := bw.skip(int64(n)); cErr != nil {
+					return cErr
+				}
 				_, seekErr := dst.Seek(int64(n), io.SeekCurrent)
 				if seekErr != nil {
 					return seekErr
 				}
 			} else {
-				_, wErr := dst.Write(buf[:n])
+				_, wErr := bw.Write(buf[:n])
 				if wErr != nil {
 					return wErr
 				}
 			}
 			total += int64(n)
-			atomic.AddInt64(written, int64(n))
 		}
 		if err == io.EOF {
 			break
@@ -179,7 +184,9 @@ func copySparseZip(dst *os.File, src io.Reader, size uint64, written *int64, ctx
 			return err
 		}
 	}
-	return dst.Truncate(int64(size))
+	// The length of the file is what came out of the entry, not what its
+	// header said would: a hole at the end is only a hole up to there.
+	return dst.Truncate(total)
 }
 
 // WithExtractorXattrs enables restoration of extended attributes (xattrs, POSIX ACLs, SELinux).
@@ -236,18 +243,222 @@ func WithExtractorTolerant(b bool) ExtractorOption {
 		return nil
 	}
 }
+
+// WithExtractorMaxFileSize sets how many bytes any one extracted file may be
+// written. Zero turns the size limit off and leaves the ratio limit to work on
+// its own; a negative limit is not a limit at all and is refused here rather
+// than turning into one somewhere further in. A file that would be written
+// past the limit fails with an error wrapping [ErrSizeLimit].
 func WithExtractorMaxFileSize(n int64) ExtractorOption {
 	return func(o *extractorOptions) error {
+		if n < 0 {
+			return fmt.Errorf("zip: maximum file size %d is negative", n)
+		}
 		o.maxFileSize = n
 		return nil
 	}
 }
 
+// WithExtractorMaxRatio sets how many bytes an entry may be written for each
+// byte it takes up in the archive. Zero turns the ratio limit off; a negative
+// ratio is refused. An entry that expands past the ratio fails with an error
+// wrapping [ErrRatioLimit].
 func WithExtractorMaxRatio(n int64) ExtractorOption {
 	return func(o *extractorOptions) error {
+		if n < 0 {
+			return fmt.Errorf("zip: maximum decompression ratio %d is negative", n)
+		}
 		o.maxDecompressionRatio = n
 		return nil
 	}
+}
+
+// An extraction refuses to write more than its caller allowed it to: one file
+// larger than the size limit, or an entry that expands out of all proportion
+// to the room it takes up in the archive. Both are returned wrapped, so
+// errors.Is finds them behind the name of the file that ran into them.
+var (
+	ErrSizeLimit  = errors.New("zip: extracted size exceeds limit")
+	ErrRatioLimit = errors.New("zip: decompression ratio exceeds limit")
+)
+
+// extractBudget is where an extraction accounts for what it writes. Every
+// destination file goes through a writer taken from it -- the ordinary copy,
+// the sparse copy, each inner file of a solid archive, and the temp copy the
+// solid fallback makes -- so nothing reaches the disk uncounted, and the
+// counting is in one place rather than in every path that happens to write.
+type extractBudget struct {
+	maxFileSize int64  // per destination file; zero means no size limit
+	maxRatio    uint64 // per archive entry; zero means no ratio limit
+	written     *int64 // the extraction's own total, read while it runs
+}
+
+func newExtractBudget(o *extractorOptions, written *int64) *extractBudget {
+	return &extractBudget{
+		maxFileSize: o.maxFileSize,
+		maxRatio:    uint64(o.maxDecompressionRatio),
+		written:     written,
+	}
+}
+
+// fallbackTooLarge says whether a solid entry is too big to copy to a temp
+// file before extracting it, at ten times the per-file limit on what the entry
+// says it holds. Divided rather than multiplied: ten times a large limit
+// overflowed into a negative number and from there into a 100 GB ceiling
+// nobody asked for.
+func (b *extractBudget) fallbackTooLarge(declared uint64) bool {
+	return b.maxFileSize > 0 && declared/10 > uint64(b.maxFileSize)
+}
+
+// entryBudget accounts for one archive entry. The ratio is measured against
+// this entry's compressed size, which is what the archive spends on it, and on
+// the solid path every inner file the entry unpacks into counts towards the
+// same entry: the ratio there is what the whole solid stream expands to.
+type entryBudget struct {
+	b          *extractBudget
+	name       string
+	compressed uint64
+	ratio      uint64 // zero means no ratio applies to this entry
+	written    int64  // over every destination file of this entry
+}
+
+func (b *extractBudget) entry(f *File) *entryBudget {
+	return &entryBudget{b: b, name: f.Name, compressed: f.CompressedSize64, ratio: b.maxRatio}
+}
+
+// duplicate is a budget for a file the extraction copies from a file it has
+// already written -- the bottom rung of the Windows link ladder, which puts
+// the target's bytes in a file of their own when neither kind of link can be
+// made. The bytes are a destination file's and count like any other, but
+// nothing was decompressed to produce them and there is no compressed size
+// behind them, so no ratio applies.
+func (b *extractBudget) duplicate(name string) *entryBudget {
+	return &entryBudget{b: b, name: name}
+}
+
+// checkHeader refuses an entry on what its header claims, before anything is
+// opened. It is an early rejection and not the limit itself -- the header is
+// the archive's word about bytes it has not produced yet -- so what is
+// actually written is counted as it is written, wherever it is written.
+func (e *entryBudget) checkHeader(uncompressed uint64) error {
+	if e.b.maxFileSize > 0 && uncompressed > uint64(e.b.maxFileSize) {
+		return fmt.Errorf("zip: file %q size %d exceeds limit %d: %w", e.name, uncompressed, e.b.maxFileSize, ErrSizeLimit)
+	}
+	// Divided, never multiplied: the product of a limit and a compressed
+	// size the archive chose overflows, and a negative product is a limit
+	// that lets everything through -- which is what a declared size above
+	// MaxInt64 used to be measured against. The remainder is what keeps the
+	// division exact: a quotient equal to the limit with anything left over
+	// is more bytes per byte than the limit allows, and dropping it would
+	// let every entry have one whole ratio more than it was given.
+	if e.ratio > 0 && e.compressed > 0 {
+		q, rem := uncompressed/e.compressed, uncompressed%e.compressed
+		if q > e.ratio || (q == e.ratio && rem != 0) {
+			return fmt.Errorf("zip: file %q suspicious compression ratio %d:1: %w", e.name, q, ErrRatioLimit)
+		}
+	}
+	return nil
+}
+
+// preallocSize is how much of a declared size is worth reserving on disk. The
+// declaration is the archive's own, so it is trusted only as far as a check
+// has bounded it: the size limit bounds it directly, and with no size limit
+// the ratio check bounds it against the compressed size -- when there is a
+// ratio to check it against, since with both limits off the caller has asked
+// for nothing to be bounded. An entry that declares no compressed bytes has
+// been through neither check, there being nothing to divide by, and gets
+// nothing reserved for it.
+func (e *entryBudget) preallocSize(declared uint64) int64 {
+	if e.b.maxFileSize > 0 {
+		return int64(min(declared, uint64(e.b.maxFileSize)))
+	}
+	if e.compressed == 0 {
+		return 0
+	}
+	return int64(declared)
+}
+
+// file returns the writer one destination file of this entry is written
+// through.
+func (e *entryBudget) file(w io.Writer) *budgetWriter {
+	return &budgetWriter{e: e, w: w, limit: e.b.maxFileSize, total: e.b.written}
+}
+
+// scratch returns the writer for a file the extraction makes for itself rather
+// than one the archive asked for: the copy the solid fallback takes of an
+// entry before handing it to a second extractor. The size limit is a limit on
+// an extracted file and this is not one -- the fallback's own ceiling allows
+// an entry ten times that size, and refusing the copy at the size limit would
+// refuse what the ceiling had just let through -- so what bounds it is the
+// entry's ratio, on the bytes as they are copied. For the same reason its
+// bytes are not the extraction's output and are counted nowhere the caller can
+// read: what came out of the archive is what the second extractor writes.
+func (e *entryBudget) scratch(w io.Writer) *budgetWriter {
+	return &budgetWriter{e: e, w: w, total: new(int64)}
+}
+
+// charge accounts for bytes that are about to become part of a file, and says
+// whether the extraction is still allowed to produce them.
+func (e *entryBudget) charge(n int64) error {
+	e.written += n
+	if e.ratio == 0 || e.written == 0 {
+		return nil
+	}
+	// Divided, never multiplied, and exactly: the product of a limit and a
+	// compressed size the archive chose overflows, and a negative product
+	// is a limit that lets everything through, while a quotient on its own
+	// would allow a whole ratio more than the limit says. The section
+	// reader stops at the compressed size, so measuring against it can only
+	// understate the ratio of what was really consumed.
+	if e.compressed > 0 {
+		q, rem := uint64(e.written)/e.compressed, uint64(e.written)%e.compressed
+		if q < e.ratio || (q == e.ratio && rem == 0) {
+			return nil
+		}
+	}
+	// Nothing compressed cannot honestly produce a byte, so output from an
+	// entry that declares none is a header that lies about one side or the
+	// other.
+	return fmt.Errorf("zip: file %q expands %d compressed bytes into %d: %w", e.name, e.compressed, e.written, ErrRatioLimit)
+}
+
+// budgetWriter is one destination file, and the only way bytes get into one.
+type budgetWriter struct {
+	e     *entryBudget
+	w     io.Writer
+	limit int64  // what this one file may take; zero means only the ratio bounds it
+	total *int64 // where these bytes are counted, atomically
+	n     int64  // bytes accounted for in this file
+}
+
+func (w *budgetWriter) Write(p []byte) (int, error) {
+	if err := w.charge(int64(len(p))); err != nil {
+		return 0, err
+	}
+	n, err := w.w.Write(p)
+	atomic.AddInt64(w.total, int64(n))
+	return n, err
+}
+
+// skip accounts for bytes that become part of the file without being written
+// to it: a hole the sparse copy seeks over is as much a part of the file as
+// the bytes around it, and counts the same in every total.
+func (w *budgetWriter) skip(n int64) error {
+	if err := w.charge(n); err != nil {
+		return err
+	}
+	atomic.AddInt64(w.total, n)
+	return nil
+}
+
+// charge accounts for bytes of this file, whether they are written or seeked
+// over, and refuses them before they reach the disk rather than after.
+func (w *budgetWriter) charge(n int64) error {
+	if w.limit > 0 && w.n+n > w.limit {
+		return fmt.Errorf("zip: file %q writes past the limit of %d bytes: %w", w.e.name, w.limit, ErrSizeLimit)
+	}
+	w.n += n
+	return w.e.charge(n)
 }
 
 type Extractor struct {
@@ -274,7 +485,15 @@ func NewExtractor(filename, chroot string, opts ...ExtractorOption) (*Extractor,
 	if err != nil {
 		return nil, err
 	}
-	return newExtractor(&zr.Reader, zr, chroot, opts)
+	e, err := newExtractor(&zr.Reader, zr, chroot, opts)
+	if err != nil {
+		// An option the caller got wrong is still an archive that was
+		// opened, and the handle is the caller's only through the
+		// extractor it is not getting.
+		zr.Close()
+		return nil, err
+	}
+	return e, nil
 }
 
 func NewExtractorFromReader(r io.ReaderAt, size int64, chroot string, opts ...ExtractorOption) (*Extractor, error) {
@@ -354,20 +573,33 @@ func (e *Extractor) Extract(ctx context.Context) (err error) {
 		}
 	}
 
+	// One budget for the whole extraction, and every path that writes takes
+	// its destination files from it.
+	budget := newExtractBudget(&e.options, &e.written)
+
 	if len(e.zr.File) == 1 && (e.zr.File[0].Name == "Solid.zip" || strings.HasSuffix(e.zr.File[0].Name, ".solid")) {
+		// A solid archive is one entry holding a whole zip, so everything
+		// it unpacks into -- every inner file, and the temp copy the
+		// fallback makes -- is accounted against that one entry.
+		eb := budget.entry(e.zr.File[0])
+
 		r, err := e.zr.File[0].Open()
 		if err != nil {
 			return err
 		}
 		defer r.Close()
 
-		err = e.extractSolidStream(r, ctx)
+		err = e.extractSolidStream(r, eb, ctx)
 		if err != nil {
-			maxFallback := int64(e.options.maxFileSize) * 10
-			if maxFallback <= 0 {
-				maxFallback = 100 * 1024 * 1024 * 1024 // 100 GB default limit
+			// A refusal by the budget is the extraction's own answer
+			// about this archive rather than a stream it could not
+			// read, and the fallback has nothing to make of it but the
+			// same answer again, after copying the whole entry to a
+			// temp file to arrive at it.
+			if errors.Is(err, ErrSizeLimit) || errors.Is(err, ErrRatioLimit) {
+				return err
 			}
-			if int64(e.zr.File[0].UncompressedSize64) > maxFallback {
+			if budget.fallbackTooLarge(e.zr.File[0].UncompressedSize64) {
 				return fmt.Errorf("zip: Solid archive too large for temp file fallback (%d bytes)", e.zr.File[0].UncompressedSize64)
 			}
 
@@ -385,12 +617,25 @@ func (e *Extractor) Extract(ctx context.Context) (err error) {
 				return err
 			}
 
+			// The copy is a second pass over the same entry rather
+			// than more of the first, so it is measured on its own:
+			// charging both passes to one budget makes an honest
+			// archive look like it expanded twice as far as it did.
+			fb := budget.entry(e.zr.File[0])
+
 			buf := getSparseBuf()
-			_, terr = io.CopyBuffer(tempFile, &ctxReader{r: r2, ctx: ctx}, buf)
+			_, terr = io.CopyBuffer(fb.scratch(tempFile), &ctxReader{r: r2, ctx: ctx}, buf)
 			putSparseBuf(buf)
 
 			r2.Close()
 			if terr != nil {
+				// A copy the budget refused is the extraction's own
+				// answer about this archive, not a sign that the
+				// archive could not be read, so it is the one to
+				// give back.
+				if errors.Is(terr, ErrSizeLimit) || errors.Is(terr, ErrRatioLimit) {
+					return terr
+				}
 				return err
 			}
 
@@ -418,7 +663,14 @@ func (e *Extractor) Extract(ctx context.Context) (err error) {
 			}
 			defer innerExtractor.Close()
 
-			return innerExtractor.Extract(ctx)
+			ierr := innerExtractor.Extract(ctx)
+			// What the second extractor wrote is what this extraction
+			// wrote: the archive was handed on to it, and the caller
+			// asked this one what came out.
+			ibytes, ientries := innerExtractor.Written()
+			atomic.AddInt64(&e.written, ibytes)
+			atomic.AddInt64(&e.entries, ientries)
+			return ierr
 		}
 	} else {
 		type extractTask struct {
@@ -449,7 +701,7 @@ func (e *Extractor) Extract(ctx context.Context) (err error) {
 							err = e.updateFileMetadata(task.path, task.file)
 						}
 					} else {
-						err = e.createFile(ctx, task.path, task.file)
+						err = e.createFile(ctx, task.path, task.file, budget)
 						if err == nil {
 							err = e.updateFileMetadata(task.path, task.file)
 						}
@@ -567,7 +819,7 @@ func (e *Extractor) Extract(ctx context.Context) (err error) {
 			if err != nil {
 				return err
 			}
-			if err := e.createLink(path, file); err != nil {
+			if err := e.createLink(path, file, budget); err != nil {
 				return err
 			}
 		}
@@ -600,7 +852,7 @@ func (e *Extractor) Extract(ctx context.Context) (err error) {
 			if err != nil {
 				return err
 			}
-			if err := e.createFile(parentCtx, path, file); err != nil {
+			if err := e.createFile(parentCtx, path, file, budget); err != nil {
 				return err
 			}
 			if err := e.updateFileMetadata(path, file); err != nil {
@@ -649,7 +901,7 @@ func (e *Extractor) Extract(ctx context.Context) (err error) {
 	return nil
 }
 
-func (e *Extractor) extractSolidStream(r io.Reader, ctx context.Context) error {
+func (e *Extractor) extractSolidStream(r io.Reader, eb *entryBudget, ctx context.Context) error {
 	buf := make([]byte, 30)
 	for {
 		if err := ctx.Err(); err != nil {
@@ -803,9 +1055,13 @@ func (e *Extractor) extractSolidStream(r io.Reader, ctx context.Context) error {
 			hasher := crc32.NewIEEE()
 			var limitR io.Reader = io.LimitReader(r, int64(uncompSize))
 
+			// The inner file is a destination file like any other, and
+			// the size limit is its own while the ratio is the solid
+			// entry's: what the whole stream expands into is measured
+			// against the one entry the archive spent bytes on.
 			// TeeReader ломает io.Copy, откатываясь к 32КБ. Форсируем 1МБ буфер.
 			buf := getSparseBuf()
-			_, err = io.CopyBuffer(f, io.TeeReader(limitR, hasher), buf)
+			_, err = io.CopyBuffer(eb.file(f), io.TeeReader(limitR, hasher), buf)
 			putSparseBuf(buf)
 
 			f.Close()
@@ -852,7 +1108,6 @@ func (e *Extractor) extractSolidStream(r io.Reader, ctx context.Context) error {
 			}
 
 			e.updateFileMetadata(path, &File{FileHeader: *fh})
-			atomic.AddInt64(&e.written, int64(uncompSize))
 		}
 		atomic.AddInt64(&e.entries, 1)
 	}
@@ -901,7 +1156,34 @@ func (e *Extractor) createDirectory(path string, file *File) error {
 	return err
 }
 
-func (e *Extractor) createLink(path string, file *File) error {
+// isAbsArchiveTarget reports whether a link target read out of an archive is
+// anchored somewhere other than the directory the link lives in.
+//
+// filepath.IsAbs cannot be used for this on its own, because it answers for
+// the platform it is running on and an archive carries the paths of the
+// machine that wrote it. On Windows it calls "/etc/passwd" relative, so the
+// target is resolved against the extraction directory and, because
+// createWindowsSymlink falls back to copying when it cannot make a link,
+// the contents of C:\etc\passwd are pulled into the tree. On Unix it calls
+// `C:\Windows\...` relative for the mirror-image reason. Each spelling slips
+// through on exactly the platform it was aimed at, so both are rejected
+// everywhere, along with drive-relative "C:name", which resolves against
+// that drive's own working directory.
+func isAbsArchiveTarget(target string) bool {
+	if target == "" {
+		return false
+	}
+	if target[0] == '/' || target[0] == '\\' {
+		return true
+	}
+	if len(target) < 2 || target[1] != ':' {
+		return false
+	}
+	c := target[0]
+	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z'
+}
+
+func (e *Extractor) createLink(path string, file *File, budget *extractBudget) error {
 	if err := os.Remove(fixOSPath(path)); err != nil && !os.IsNotExist(err) {
 		return err
 	}
@@ -918,7 +1200,7 @@ func (e *Extractor) createLink(path string, file *File) error {
 		}
 
 		target := string(name)
-		if filepath.IsAbs(target) {
+		if isAbsArchiveTarget(target) {
 			return fmt.Errorf("zip: absolute symlink target not allowed: %s", target)
 		}
 
@@ -933,10 +1215,10 @@ func (e *Extractor) createLink(path string, file *File) error {
 
 		if runtime.GOOS == "windows" {
 			isDir := false
-			if fi, err := os.Stat(fixOSPath(filepath.Join(filepath.Dir(path), target))); err == nil {
+			if fi, err := os.Stat(fixOSPath(resolvedTarget)); err == nil {
 				isDir = fi.IsDir()
 			}
-			if err := createWindowsSymlink(target, path, isDir); err != nil {
+			if err := createWindowsSymlink(target, resolvedTarget, path, isDir, budget.duplicate(file.Name)); err != nil {
 				return err
 			}
 		} else {
@@ -945,11 +1227,21 @@ func (e *Extractor) createLink(path string, file *File) error {
 			}
 		}
 	} else if file.Linkname != "" {
-		linkname := file.Linkname
-		if strings.Contains(linkname, MappedStringMarkStr) {
-			linkname = string(encodeMappedString(linkname))
+		// A hard link names its target relative to the extraction root, and
+		// filepath.Join cleans, so a leading ".." used to eat the root and
+		// leave a link to a file outside it -- after which the metadata below
+		// chmods and chowns that outside file through the link. absPath is the
+		// same resolution every other entry goes through: it applies the
+		// on-disk spelling and refuses a name that climbs out. It cannot see a
+		// drive-letter or leading-separator target for what it is on the wrong
+		// platform, which is what isAbsArchiveTarget is for.
+		if isAbsArchiveTarget(file.Linkname) {
+			return fmt.Errorf("zip: absolute hard link target not allowed: %s", file.Linkname)
 		}
-		targetPath := filepath.Join(e.chroot, linkname)
+		targetPath, err := e.absPath(file.Linkname)
+		if err != nil {
+			return err
+		}
 		if err := os.Link(fixOSPath(targetPath), fixOSPath(path)); err != nil {
 			return err
 		}
@@ -961,18 +1253,13 @@ func (e *Extractor) createLink(path string, file *File) error {
 	return err
 }
 
-func (e *Extractor) createFile(ctx context.Context, path string, file *File) (err error) {
-	// 1. Preliminary check based on the header
-	if e.options.maxFileSize > 0 && file.UncompressedSize64 > uint64(e.options.maxFileSize) {
-		return fmt.Errorf("zip: file %q size %d exceeds limit %d", file.Name, file.UncompressedSize64, e.options.maxFileSize)
-	}
-
-	if e.options.maxDecompressionRatio > 0 && file.CompressedSize64 > 0 {
-		// Use multiplication instead of division to avoid rounding issues and division by zero
-		if int64(file.UncompressedSize64) > e.options.maxDecompressionRatio*int64(file.CompressedSize64) {
-			ratio := int64(file.UncompressedSize64 / file.CompressedSize64)
-			return fmt.Errorf("zip: file %q suspicious compression ratio %d:1", file.Name, ratio)
-		}
+func (e *Extractor) createFile(ctx context.Context, path string, file *File, budget *extractBudget) (err error) {
+	// The header is the archive's word about bytes it has not produced
+	// yet, so it is worth a rejection before anything is opened and worth
+	// nothing after that: what is written is counted as it is written.
+	eb := budget.entry(file)
+	if err := eb.checkHeader(file.UncompressedSize64); err != nil {
+		return err
 	}
 
 	if err := os.Remove(fixOSPath(path)); err != nil && !os.IsNotExist(err) {
@@ -1008,32 +1295,38 @@ func (e *Extractor) createFile(ctx context.Context, path string, file *File) (er
 		}
 	}()
 
-	if err := preallocate(f, int64(file.UncompressedSize64)); err != nil {
+	if err := preallocate(f, eb.preallocSize(file.UncompressedSize64)); err != nil {
 		return err
 	}
 
+	// Every byte of the file goes through the budget, which is what makes
+	// the limits limits: the reader used to be wrapped in a LimitedReader
+	// and then probed for one byte more, a second mechanism beside the
+	// header check that the solid path had no share of at all.
+	bw := eb.file(f)
+
 	if strings.HasSuffix(file.Name, ":Zone.Identifier") {
+		// The whole of it is read before any of it can be sanitized, and
+		// what bounds that is not the budget: File.Open wraps the
+		// decompressor in a reader limited to the declared uncompressed
+		// size, and the header check above has already held that number
+		// to the size limit. With no size limit the caller has asked for
+		// none, here as everywhere else.
 		data, err := io.ReadAll(r)
 		if err != nil {
 			return err
 		}
 		sanitized := sanitizeZoneIdentifier(data)
-		_, err = f.Write(sanitized)
+		_, err = bw.Write(sanitized)
 		if err == nil {
 			f.Truncate(int64(len(sanitized)))
-			atomic.AddInt64(&e.written, int64(len(sanitized)))
 		}
 		incOnSuccess(&e.entries, err)
 		return err
 	}
 
-	var lr io.Reader = r
-	if e.options.maxFileSize > 0 {
-		lr = &io.LimitedReader{R: r, N: e.options.maxFileSize}
-	}
-
 	if e.options.sparse {
-		err = copySparseZip(f, lr, file.UncompressedSize64, &e.written, ctx)
+		err = copySparseZip(f, r, bw, ctx)
 	} else {
 		buf := getSparseBuf()
 		defer putSparseBuf(buf)
@@ -1042,11 +1335,9 @@ func (e *Extractor) createFile(ctx context.Context, path string, file *File) (er
 			if err := ctx.Err(); err != nil {
 				return err
 			}
-			n, errRead := lr.Read(buf)
+			n, errRead := r.Read(buf)
 			if n > 0 {
-				wn, werr := f.Write(buf[:n])
-				atomic.AddInt64(&e.written, int64(wn))
-				if werr != nil {
+				if _, werr := bw.Write(buf[:n]); werr != nil {
 					err = werr
 					break
 				}
@@ -1058,14 +1349,6 @@ func (e *Extractor) createFile(ctx context.Context, path string, file *File) (er
 				err = errRead
 				break
 			}
-		}
-	}
-
-	// If we read everything allowed by the limit, but data still remains in the source reader - it's a bomb
-	if e.options.maxFileSize > 0 {
-		tmp := make([]byte, 1)
-		if n, _ := r.Read(tmp); n > 0 {
-			return fmt.Errorf("zip: file %q decompression exceeded maxFileSize limit", file.Name)
 		}
 	}
 
@@ -1131,11 +1414,24 @@ func (e *Extractor) updateFileMetadata(path string, file *File) error {
 	return e.options.chownErrorHandler(file.Name, err)
 }
 func (e *Extractor) absPath(name string) (string, error) {
+	// An entry whose name ends in a separator is a directory, and a directory
+	// entry that names the extraction root itself is the one harmless way to
+	// clean to ".": it goes to MkdirAll, which has nothing left to do.
+	isDirEntry := strings.HasSuffix(name, "/") || strings.HasSuffix(name, `\`)
 	if strings.Contains(name, MappedStringMarkStr) {
 		name = string(encodeMappedString(name))
 	}
 	cleanName := filepath.ToSlash(filepath.Clean(name))
-	if strings.HasPrefix(cleanName, "../") || strings.HasPrefix(cleanName, "/") {
+	// filepath.Clean answers ".." with itself, which has neither a "../"
+	// prefix nor a "/" one, so a bare ".." resolved to the parent of the
+	// extraction directory and said nothing. "." is the same hole one step
+	// short: it names the extraction directory, and a file entry there is
+	// written over the directory the caller handed in -- os.Remove takes an
+	// empty one away and OpenFile puts a regular file where it was.
+	if cleanName == ".." || strings.HasPrefix(cleanName, "../") || strings.HasPrefix(cleanName, "/") {
+		return "", ErrInsecurePath
+	}
+	if cleanName == "." && !isDirEntry {
 		return "", ErrInsecurePath
 	}
 	return filepath.Join(e.chroot, cleanName), nil

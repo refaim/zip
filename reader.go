@@ -4,10 +4,12 @@ import (
 	"bufio"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"hash"
 	"hash/crc32"
 	"io"
 	"io/fs"
+	"math"
 	"os"
 	"path"
 	"path/filepath"
@@ -541,9 +543,18 @@ func (f *File) findHiddenIndex() (int, []byte, error) {
 		}
 	}
 
+	// The size of the payload is the hidden entry's own to declare -- a
+	// uint32, or the whole range of a uint64 through its zip64 extra -- and
+	// the buffer for it used to be made from that declaration before a byte
+	// of the payload had been read. Reading through a section reader bounds
+	// the allocation by the bytes the archive actually holds; anything the
+	// index is then short of is caught where the payload is parsed.
+	if compSize64 > math.MaxInt64 {
+		return 0, nil, fmt.Errorf("zip: seek index declares %d bytes: %w", compSize64, ErrFormat)
+	}
 	dataOffset := endOffset + fileHeaderLen + int64(filenameLen) + int64(extraLen)
-	payload := make([]byte, compSize64)
-	if _, err := f.zipr.ReadAt(payload, dataOffset); err != nil {
+	payload, err := io.ReadAll(io.NewSectionReader(f.zipr, dataOffset, int64(compSize64)))
+	if err != nil {
 		return 0, nil, err
 	}
 
@@ -552,6 +563,13 @@ func (f *File) findHiddenIndex() (int, []byte, error) {
 
 // OpenSeekable returns a ReadSeeker for the file content.
 // It requires a Seek Index (Hidden SOZip or GZIDX) to be present in the archive for compressed files.
+//
+// For an AES-encrypted entry the bytes this returns are decrypted but not
+// authenticated: reading at an offset cannot check an authentication code
+// computed over the whole entry, so the AE-2 code that Open verifies is not
+// verified here, and AE-2 leaves the CRC zero as well. AES-CTR is malleable,
+// so a flipped bit in the archive is a flipped bit in what this hands back,
+// and nothing reports it. Use Open where the data has to be trusted.
 func (f *File) OpenSeekable() (io.ReadSeeker, error) {
 	actualMethod := f.Method
 	if f.Method == winzipAesExtraID && f.aesInfo != nil {
@@ -598,15 +616,30 @@ func (f *File) OpenSeekable() (io.ReadSeeker, error) {
 		if offsetSize != 8 {
 			return nil, errors.New("zip: unsupported SOZip offset size")
 		}
+		// The index is read out of a hidden entry nothing signs and nothing
+		// checksums, and every number in it is used as an offset into the
+		// entry it indexes. A chunk size of zero is the divisor the wanted
+		// offset is divided by when a chunk is looked up.
+		if chunkSize == 0 {
+			return nil, fmt.Errorf("zip: SOZip index chunk size is zero: %w", ErrFormat)
+		}
+
+		// The first offset is this parser's own zero rather than the
+		// archive's, so it is the rest that have to be true of the entry:
+		// inside it, and in the order the chunks are in.
+		index := []uint64{0}
+		prev := uint64(0)
+		for offsetData := payload[32:]; len(offsetData) >= 8; offsetData = offsetData[8:] {
+			off := binary.LittleEndian.Uint64(offsetData[:8])
+			if off > f.CompressedSize64 || off < prev {
+				return nil, fmt.Errorf("zip: SOZip index offset %d is outside the entry: %w", off, ErrFormat)
+			}
+			prev = off
+			index = append(index, off)
+		}
 
 		f.SeekChunkSize = chunkSize
-		f.SeekIndex = []uint64{0}
-
-		offsetData := payload[32:]
-		for len(offsetData) >= 8 {
-			f.SeekIndex = append(f.SeekIndex, binary.LittleEndian.Uint64(offsetData[:8]))
-			offsetData = offsetData[8:]
-		}
+		f.SeekIndex = index
 
 		return &solidReadSeeker{f: f}, nil
 	}
@@ -618,29 +651,46 @@ func (f *File) OpenSeekable() (io.ReadSeeker, error) {
 		chunkSize := binary.LittleEndian.Uint32(payload[23:27])
 		numPoints := binary.LittleEndian.Uint32(payload[31:35])
 
-		if 35+int(numPoints)*18 > len(payload) {
-			return nil, errors.New("zip: invalid GZIDX payload (too short for points)")
+		// How many points the payload can hold, rather than how long a
+		// payload the claimed count would need: the count is the archive's,
+		// and multiplying it by the size of a point wraps on a 32-bit build
+		// -- above 119304647 points the product comes out small enough to
+		// pass for a payload that holds nothing of the sort, and the loop
+		// below then reads past it. The length of the payload is known to
+		// be at least 35 by the check above.
+		if uint64(numPoints) > uint64(len(payload)-35)/18 {
+			return nil, fmt.Errorf("zip: invalid GZIDX payload (too short for %d points): %w", numPoints, ErrFormat)
+		}
+		if chunkSize == 0 {
+			return nil, fmt.Errorf("zip: GZIDX index chunk size is zero: %w", ErrFormat)
 		}
 
-		f.SeekChunkSize = chunkSize
-		f.GzidxPoints = make([]gzPoint, numPoints)
+		points := make([]gzPoint, numPoints)
 		offset := 35
 		for i := 0; i < int(numPoints); i++ {
-			f.GzidxPoints[i].compOffset = binary.LittleEndian.Uint64(payload[offset:])
-			f.GzidxPoints[i].uncompOffset = binary.LittleEndian.Uint64(payload[offset+8:])
-			f.GzidxPoints[i].bits = payload[offset+16]
-			f.GzidxPoints[i].hasData = payload[offset+17]
+			points[i].compOffset = binary.LittleEndian.Uint64(payload[offset:])
+			points[i].uncompOffset = binary.LittleEndian.Uint64(payload[offset+8:])
+			points[i].bits = payload[offset+16]
+			points[i].hasData = payload[offset+17]
+			// A point names a place in the entry on both sides of the
+			// decompressor, and both of them are read from as offsets.
+			if points[i].compOffset > f.CompressedSize64 || points[i].uncompOffset > f.UncompressedSize64 {
+				return nil, fmt.Errorf("zip: GZIDX point %d is outside the entry: %w", i, ErrFormat)
+			}
 			offset += 18
 		}
 		for i := 0; i < int(numPoints); i++ {
-			if f.GzidxPoints[i].hasData == 1 {
+			if points[i].hasData == 1 {
 				if offset+32768 > len(payload) {
 					return nil, errors.New("zip: invalid GZIDX payload (truncated window data)")
 				}
-				f.GzidxPoints[i].window = payload[offset : offset+32768]
+				points[i].window = payload[offset : offset+32768]
 				offset += 32768
 			}
 		}
+
+		f.SeekChunkSize = chunkSize
+		f.GzidxPoints = points
 		return &solidReadSeeker{f: f, isContinuous: true}, nil
 	}
 
@@ -1111,6 +1161,16 @@ parseExtras:
 		return ErrFormat
 	}
 
+	// Both sizes and the offset of the local header leave this package as
+	// int64: Open, OpenRaw and OpenSeekable hand them to io.NewSectionReader
+	// and FileInfo returns a size. Above MaxInt64 each of them arrives
+	// negative there, and a section reader given a negative length reads
+	// without a bound from an offset the archive picked. An archive that
+	// large does not exist, so the entry is simply not a valid one.
+	if f.CompressedSize64 > math.MaxInt64 || f.UncompressedSize64 > math.MaxInt64 || f.headerOffset < 0 {
+		return ErrFormat
+	}
+
 	return nil
 }
 
@@ -1191,8 +1251,12 @@ func readDirectoryEnd(r io.ReaderAt, size int64) (dir *directoryEnd, baseOffset 
 	if d.directoryRecords == 0xffff || d.directorySize == 0xffff || d.directoryOffset == 0xffffffff {
 		p, err := findDirectory64End(r, directoryEndOffset)
 		if err == nil && p >= 0 {
+			// The locator sits between the record and the end record,
+			// so what is left between the record's first byte and the
+			// locator is all the room the record has.
+			room := max(directoryEndOffset-directory64LocLen-p-12, 0)
 			directoryEndOffset = p
-			err = readDirectory64End(r, p, d)
+			err = readDirectory64End(r, p, room, d)
 		}
 		if err != nil {
 			return nil, 0, err
@@ -1248,7 +1312,11 @@ func findDirectory64End(r io.ReaderAt, directoryEndOffset int64) (int64, error) 
 	return int64(p), nil
 }
 
-func readDirectory64End(r io.ReaderAt, offset int64, d *directoryEnd) (err error) {
+// readDirectory64End reads the zip64 end record at offset. room is how many
+// bytes of record content the archive has room for: the locator that named the
+// record sits immediately after it, so the space between the two is the most
+// the record can hold, whatever the record says about itself.
+func readDirectory64End(r io.ReaderAt, offset, room int64, d *directoryEnd) (err error) {
 	// 1. Read the first 12 bytes to get the actual record size
 	var hbuf [12]byte
 	if _, err := r.ReadAt(hbuf[:], offset); err != nil {
@@ -1261,8 +1329,25 @@ func readDirectory64End(r io.ReaderAt, offset int64, d *directoryEnd) (err error
 	// recordSize is the size of the record minus the first 12 bytes (sig + size)
 	recordSize := hb.uint64()
 
-	// 2. Read the rest of the record
-	buf := make([]byte, recordSize)
+	// 2. Read the rest of the record, which is as much of it as is used and
+	// no more. The size of the record is eight bytes of the archive's own
+	// choosing, and the buffer for it used to be made from that number
+	// before a byte of the record had been read -- a quarter of the address
+	// space asked for this way is a panic, not an archive the reader
+	// rejects. What is read also has to be the record's own, which is what
+	// room is for: a record that claims to reach past where the locator
+	// says it ends has its version 2 fields read out of the locator and the
+	// end record instead, and the end record's signature carries the bit
+	// that says the central directory is encrypted -- so an archive that
+	// reads perfectly well announces that it cannot be read. A record too
+	// short for the fields below is not a record either, since readBuf
+	// reads them without looking at what is left.
+	const maxRecord = directory64EndLen - 12 + 24 // the fields below, plus the version 2 ones
+	held := min(recordSize, uint64(room))
+	if held < directory64EndLen-12 {
+		return ErrFormat
+	}
+	buf := make([]byte, min(held, uint64(maxRecord)))
 	if _, err := r.ReadAt(buf, offset+12); err != nil {
 		return err
 	}

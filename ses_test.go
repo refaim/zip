@@ -33,7 +33,7 @@ func TestReadDirectory64End_V2_SES(t *testing.T) {
 	ra := bytes.NewReader(data)
 
 	d := &directoryEnd{}
-	err := readDirectory64End(ra, 0, d)
+	err := readDirectory64End(ra, 0, 44+24, d)
 	if err != nil {
 		t.Fatalf("failed to read V2 EOCD: %v", err)
 	}
