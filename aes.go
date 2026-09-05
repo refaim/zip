@@ -88,7 +88,7 @@ func newWinZipAesReader(r io.Reader, password string, info *winzipAesInfo, compr
 		return nil, 0, err
 	}
 	if !hmac.Equal(verifBuf, pwVerif) {
-		return nil, 0, errors.New("zip: incorrect password")
+		return nil, 0, ErrPassword
 	}
 
 	block, err := aes.NewCipher(encKey)
@@ -171,7 +171,7 @@ func newWinZipAesReaderAt(r io.ReaderAt, password string, info *winzipAesInfo, c
 		return nil, err
 	}
 	if !hmac.Equal(verifBuf, pwVerif) {
-		return nil, errors.New("zip: incorrect password")
+		return nil, ErrPassword
 	}
 
 	limit := compressedSize - int64(saltLen) - 2 - 10

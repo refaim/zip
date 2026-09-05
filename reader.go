@@ -26,7 +26,59 @@ var (
 	ErrAlgorithm    = errors.New("zip: unsupported compression algorithm")
 	ErrChecksum     = errors.New("zip: checksum error")
 	ErrInsecurePath = errors.New("zip: insecure file path")
+	// ErrPassword is returned when an encrypted entry rejects the password
+	// up front: the ZipCrypto check byte or the WinZip AES password
+	// verifier does not match.
+	ErrPassword = errors.New("zip: incorrect password")
 )
+
+// EncryptedDataError is returned when the payload of an encrypted entry
+// fails validation after the password passed the format's cheap check: the
+// CRC does not match, the AES authentication code does not match, or the
+// decrypted bytes are not a valid deflate stream. The ZipCrypto check is a
+// single byte, so 1 in 256 wrong passwords reaches this point; the WinZip
+// AES verifier is two bytes. The error therefore means either a wrong
+// password or corrupt data, and errors.Is reports both ErrPassword and the
+// underlying cause (ErrChecksum, flate.CorruptInputError, ...), so callers
+// that re-prompt for a password on ErrPassword do so here as well.
+type EncryptedDataError struct {
+	Err error
+}
+
+func (e *EncryptedDataError) Error() string {
+	return e.Err.Error() + " (encrypted entry: incorrect password or corrupt data)"
+}
+
+func (e *EncryptedDataError) Unwrap() error { return e.Err }
+
+func (e *EncryptedDataError) Is(target error) bool { return target == ErrPassword }
+
+// encryptedDataError wraps err when it is a wrong-password symptom of an
+// encrypted entry and returns it unchanged otherwise. Store entries can only
+// betray a wrong password through the CRC; compressed entries additionally
+// through a corrupt or truncated compressed stream.
+func encryptedDataError(f *File, err error) error {
+	if err == nil || f == nil || !f.IsEncrypted() {
+		return err
+	}
+	var already *EncryptedDataError
+	if errors.As(err, &already) {
+		return err
+	}
+	if errors.Is(err, ErrChecksum) {
+		return &EncryptedDataError{Err: err}
+	}
+	if f.Method != Store {
+		// Garbage fed to a decompressor shows up as a corrupt stream, a
+		// stream that ends early, or one that inflates past the declared
+		// size (ErrFormat from checksumReader).
+		var corrupt flate.CorruptInputError
+		if errors.As(err, &corrupt) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, ErrFormat) {
+			return &EncryptedDataError{Err: err}
+		}
+	}
+	return err
+}
 
 // DisableInsecurePaths controls whether paths containing ".." or "\" are rejected.
 var DisableInsecurePaths bool
@@ -351,7 +403,7 @@ func (f *File) Open() (io.ReadCloser, error) {
 				checkByte = byte(f.ModifiedTime >> 8)
 			}
 			if header[11] != checkByte {
-				return nil, errors.New("zip: incorrect password")
+				return nil, ErrPassword
 			}
 			encryptionOffset = 12
 			// Shift the base reader for classic encryption
@@ -775,14 +827,14 @@ func (r *checksumReader) Read(b []byte) (n int, err error) {
 	r.hash.Write(b[:n])
 	r.nread += uint64(n)
 	if r.nread > r.f.UncompressedSize64 {
-		return 0, ErrFormat
+		return 0, encryptedDataError(r.f, ErrFormat)
 	}
 	if err == nil {
 		return
 	}
 	if err == io.EOF {
 		if r.nread != r.f.UncompressedSize64 {
-			return 0, io.ErrUnexpectedEOF
+			return 0, encryptedDataError(r.f, io.ErrUnexpectedEOF)
 		}
 		if r.f.Method == winzipAesExtraID {
 			if _, macErr := io.Copy(io.Discard, r.rr); macErr != nil {
@@ -806,6 +858,7 @@ func (r *checksumReader) Read(b []byte) (n int, err error) {
 			}
 		}
 	}
+	err = encryptedDataError(r.f, err)
 	r.err = err
 	return
 }

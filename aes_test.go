@@ -6,6 +6,7 @@ import (
 	"crypto/cipher"
 	"crypto/hmac"
 	"crypto/sha1"
+	"errors"
 	"io"
 	"testing"
 
@@ -200,8 +201,8 @@ func TestWinZipAES_CorruptedMAC(t *testing.T) {
 
 	decrypted, err := io.ReadAll(rc)
 	t.Logf("[DEBUG-TEST] ReadAll returned error: %v, decrypted len: %d", err, len(decrypted))
-	if err != ErrChecksum {
-		t.Fatalf("Expected ErrChecksum due to corrupted MAC, got: %v", err)
+	if !errors.Is(err, ErrChecksum) || !errors.Is(err, ErrPassword) {
+		t.Fatalf("Expected ErrChecksum wrapped as an encrypted-data error due to corrupted MAC, got: %v", err)
 	}
 }
 func TestWinZipAES_Writer_BufResizing(t *testing.T) {
