@@ -88,35 +88,48 @@ func buildHuffmanTree(freqs []uint32, maxDepth int, lengths []byte) {
 	limitCodeLengths(lengths, maxDepth)
 }
 
+// limitCodeLengths rewrites a code whose longest word runs past maxDepth,
+// which the block header has no field to spell. Every alphabet it is called
+// with fits maxDepth levels - 2^maxDepth is well above the number of symbols -
+// so a code within the limit always exists.
 func limitCodeLengths(lengths []byte, maxDepth int) {
 	var count [33]int
 	for _, l := range lengths {
-		if l > 0 {
-			if int(l) < len(count) {
-				count[l]++
-			}
+		if l == 0 {
+			continue
 		}
+		d := int(l)
+		if d > maxDepth {
+			d = maxDepth
+		}
+		count[d]++
 	}
 
-	overflow := 0
-	for d := 32; d > maxDepth; d-- {
-		if count[d] > 0 {
-			overflow += count[d]
-			count[d] = 0
-		}
+	// The code space the words take, counted in leaves of a full maxDepth
+	// level tree. A tree that stayed inside the limit uses exactly all of it,
+	// so anything more is the cost of the words that were cut back to it.
+	limit := 1 << maxDepth
+	used := 0
+	for d := 1; d <= maxDepth; d++ {
+		used += count[d] << (maxDepth - d)
 	}
-
-	if overflow == 0 {
+	if used <= limit {
 		return
 	}
 
-	// Redistribute overflow bits onto shorter branches
-	for d := maxDepth; d > 0; d-- {
-		for count[d] > 0 && overflow > 0 {
-			count[d]--
-			count[d+1] += 2
-			overflow--
+	// Give the space back by lengthening words, always the longest one that
+	// can still grow: that is the smallest repayment on offer, so the code
+	// stays as close to the tree it came from as the limit allows. While the
+	// words take more space than a full maxDepth level tree has, they cannot
+	// all be at maxDepth already, so one is always left to lengthen.
+	for used > limit {
+		d := maxDepth - 1
+		for count[d] == 0 {
+			d--
 		}
+		count[d]--
+		count[d+1]++
+		used -= 1 << (maxDepth - d - 1)
 	}
 
 	// Assign new lengths to the symbols

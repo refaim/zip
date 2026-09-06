@@ -29,11 +29,17 @@ func (e filePoolCloseError) Error() string {
 	return sb.String()
 }
 
-func (e filePoolCloseError) Unwrap() error {
-	if len(e) > 1 {
-		return e[1:]
+// Unwrap hands back every failure closing the pool reported, so that
+// errors.Is and errors.As can find any of them. Handing back one at a time
+// cannot work here: what would stand between two failures is the list itself,
+// and a list of failures is not equal to, and does not match, any failure in
+// it -- so a caller asking whether a close ran into os.ErrClosed would always
+// be told no.
+func (e filePoolCloseError) Unwrap() []error {
+	if len(e) == 0 {
+		return nil
 	}
-	return nil
+	return e
 }
 
 // FilePool represents a pool of files that can be used as buffers.

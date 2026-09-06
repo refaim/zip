@@ -176,37 +176,51 @@ type win32FindStreamData struct {
 	StreamName [260 + 36]uint16
 }
 
+// getFileSecurityW is the GetFileSecurityW call behind a name a test can take
+// over. It fills buf with the security descriptor of path and reports the
+// length that descriptor needs, which is how a caller holding no buffer learns
+// how large a one to come back with. The addresses stay on this side of the
+// name: what is taken over is the answer the object gives, never the place it
+// was written to.
+var getFileSecurityW = func(path *uint16, secInfo uint32, buf []byte) (needed uint32, err error) {
+	var descriptor unsafe.Pointer
+	if len(buf) > 0 {
+		descriptor = unsafe.Pointer(&buf[0])
+	}
+	r1, _, err := procGetFileSecurityW.Call(
+		uintptr(unsafe.Pointer(path)),
+		uintptr(secInfo),
+		uintptr(descriptor),
+		uintptr(len(buf)),
+		uintptr(unsafe.Pointer(&needed)),
+	)
+	// The call reports what went wrong through the thread's last error,
+	// which says nothing at all until the returned handle has been looked
+	// at: a zero there is the only thing that makes the error an error.
+	if r1 == 0 {
+		return needed, err
+	}
+	return needed, nil
+}
+
 func getFileSecurity(path string) ([]byte, error) {
 	pathPtr, err := syscall.UTF16PtrFromString(fixOSPath(path))
 	if err != nil {
 		return nil, err
 	}
 	const secInfo = 7 // OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION
-	var needed uint32
-	r1, _, err := procGetFileSecurityW.Call(
-		uintptr(unsafe.Pointer(pathPtr)),
-		uintptr(secInfo),
-		0,
-		0,
-		uintptr(unsafe.Pointer(&needed)),
-	)
-	if r1 == 0 {
-		if err != windows.ERROR_INSUFFICIENT_BUFFER {
-			return nil, err
-		}
+	// Asking with no buffer is how the length is learned, so the refusal
+	// that says the buffer was too small is the answer here and not a
+	// failure. Anything else is one.
+	needed, err := getFileSecurityW(pathPtr, secInfo, nil)
+	if err != nil && err != windows.ERROR_INSUFFICIENT_BUFFER {
+		return nil, err
 	}
 	if needed == 0 {
 		return nil, nil
 	}
 	buf := make([]byte, needed)
-	r1, _, err = procGetFileSecurityW.Call(
-		uintptr(unsafe.Pointer(pathPtr)),
-		uintptr(secInfo),
-		uintptr(unsafe.Pointer(&buf[0])),
-		uintptr(needed),
-		uintptr(unsafe.Pointer(&needed)),
-	)
-	if r1 == 0 {
+	if _, err := getFileSecurityW(pathPtr, secInfo, buf); err != nil {
 		return nil, err
 	}
 	return buf, nil

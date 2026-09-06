@@ -98,8 +98,8 @@ func TestExtractor_SafeWritesSweepsUpAFailedMove(t *testing.T) {
 	// counted as extracted, and that the temporary file does not survive.
 	moveFailed := errors.New("the entry could not be moved into place")
 	original := rename
-	rename = func(string, string) error { return moveFailed }
 	t.Cleanup(func() { rename = original })
+	rename = func(string, string) error { return moveFailed }
 
 	raw := safeWritesArchive(t, "entry.bin", []byte("contents"))
 

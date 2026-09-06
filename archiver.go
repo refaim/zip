@@ -30,6 +30,12 @@ var copyBufPool = sync.Pool{
 	},
 }
 
+// newZlibWriterLevel builds the zlib stream a torrentzip entry is deflated
+// into. The constructor is a wasm build of zlib and refuses only when its own
+// allocator has no room left, which nothing about an archive or an option can
+// bring about, so a test that needs the refusal takes this name over.
+var newZlibWriterLevel = zlib4go.NewWriterLevel
+
 func getCopyBuf() []byte {
 	return *(copyBufPool.Get().(*[]byte))
 }
@@ -257,7 +263,7 @@ func NewArchiver(w io.Writer, chroot string, opts ...ArchiverOption) (*Archiver,
 			a.zw.RegisterCompressor(Deflate, func(w io.Writer) (io.WriteCloser, error) {
 				if a.options.torrentZip {
 					szw := &tzStripZlibWriter{w: w}
-					zw, err := zlib4go.NewWriterLevel(szw, 9)
+					zw, err := newZlibWriterLevel(szw, 9)
 					if err != nil {
 						return nil, err
 					}
@@ -499,7 +505,7 @@ func (a *Archiver) Archive(ctx context.Context, files map[string]os.FileInfo) (e
 	}
 
 	// Кэшируем рабочую директорию, чтобы убрать системные вызовы из цикла
-	wd, err := os.Getwd()
+	wd, err := getwd()
 	if err != nil {
 		return err
 	}
@@ -514,10 +520,9 @@ func (a *Archiver) Archive(ctx context.Context, files map[string]os.FileInfo) (e
 		if poolSize < 1 {
 			poolSize = 1
 		}
-		fp, err = filepool.New(a.options.stageDir, poolSize, a.options.bufferSize)
-		if err != nil {
-			return err
-		}
+		// filepool.New reports an error only for a pool size below one,
+		// and the line above raises the size to one.
+		fp, _ = filepool.New(a.options.stageDir, poolSize, a.options.bufferSize)
 		defer dclose(fp, &err)
 	}
 

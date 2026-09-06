@@ -20,7 +20,9 @@ It combines the stability of the standard library with the best open-source ZIP 
 
 *   **Broad Compression Support:**
     *   Built-in **Deflate64** (Method 9) decoder, used by Windows for large files.
-    *   Support for **BZIP2**, **LZMA**, and **PPMd** decompression.
+    *   Support for **BZIP2** and **LZMA** decompression. **PPMd** entries are
+        recognised and refused with a clear error: ZIP uses PPMd variant I
+        (APPNOTE 5.10), and no decoder for it is available here.
 
 *   **In-Place Updates (Updater):** Modify existing ZIP files by appending or overwriting entries without performing a full re-compression of the entire archive.
 

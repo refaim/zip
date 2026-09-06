@@ -113,6 +113,26 @@ func stripComponents(name string, count int) (string, bool) {
 	return strings.Join(parts[count:], "/"), true
 }
 
+// strippedName is the name an entry is extracted under: the one the archive
+// carries, with as many leading components taken off it as the caller asked
+// for. It reports false for an entry that has no more components than that,
+// which is an entry the extraction does not write at all.
+//
+// An extraction goes over the archive more than once -- the files and
+// directories first, then the links, the directories' metadata and the
+// alternate data streams -- and every pass has to arrive at the same name for
+// an entry. The passes after the first used to take the archive's name as it
+// stood, so with --strip-components a link was made under the name the entry
+// carried rather than the one its target had been written under, and a
+// directory's metadata was applied to a name nothing had created, which failed
+// the extraction of any archive that had a directory entry in it.
+func (e *Extractor) strippedName(name string) (string, bool) {
+	if e.options.stripComponents <= 0 {
+		return name, true
+	}
+	return stripComponents(name, e.options.stripComponents)
+}
+
 // WithExtractorSparse enables extracting files as sparse files by seeking over zero-blocks (-S, --sparse).
 func WithExtractorSparse(b bool) ExtractorOption {
 	return func(o *extractorOptions) error {
@@ -638,6 +658,13 @@ func (e *Extractor) Extract(ctx context.Context) (err error) {
 			isIrregular bool
 		}
 
+		// Where every entry goes, resolved once by the pass below and read
+		// by the three passes after it, so that they act on the name the
+		// extraction wrote rather than resolving the archive's own name a
+		// second time. An empty path is an entry the extraction does not
+		// write: one --strip-components leaves nothing of.
+		paths := make([]string, len(e.zr.File))
+
 		taskCh := make(chan extractTask, e.options.concurrency)
 
 		wg, ctx := errgroup.WithContext(ctx)
@@ -680,19 +707,16 @@ func (e *Extractor) Extract(ctx context.Context) (err error) {
 		err = func() error {
 			defer close(taskCh)
 			for i, file := range e.zr.File {
-				name := file.Name
-				if e.options.stripComponents > 0 {
-					stripped, ok := stripComponents(name, e.options.stripComponents)
-					if !ok {
-						continue // Skip file with fewer or equal components
-					}
-					name = stripped
+				name, ok := e.strippedName(file.Name)
+				if !ok {
+					continue // Skip file with fewer or equal components
 				}
 
 				path, err := e.absPath(name)
 				if err != nil {
 					return err
 				}
+				paths[i] = path
 
 				prefix := e.chroot
 				if !strings.HasSuffix(prefix, string(filepath.Separator)) {
@@ -781,32 +805,28 @@ func (e *Extractor) Extract(ctx context.Context) (err error) {
 			return waitErr
 		}
 
-		for _, file := range e.zr.File {
+		for i, file := range e.zr.File {
 			if file.Mode()&os.ModeSymlink == 0 && file.Linkname == "" {
 				continue
 			}
-			path, err := e.absPath(file.Name)
-			if err != nil {
-				return err
+			path := paths[i]
+			if path == "" {
+				continue
 			}
 			if err := e.createLink(path, file, budget); err != nil {
 				return err
 			}
 		}
 
-		for _, file := range e.zr.File {
+		for i, file := range e.zr.File {
 			if !file.Mode().IsDir() {
 				continue
 			}
-			path, err := e.absPath(file.Name)
-			if err != nil {
-				if e.options.tolerant {
-					continue
-				}
-				return err
+			path := paths[i]
+			if path == "" {
+				continue
 			}
-			err = e.updateFileMetadata(path, file)
-			if err != nil {
+			if err := e.updateFileMetadata(path, file); err != nil {
 				if e.options.tolerant {
 					continue
 				}
@@ -814,13 +834,13 @@ func (e *Extractor) Extract(ctx context.Context) (err error) {
 			}
 		}
 
-		for _, file := range e.zr.File {
+		for i, file := range e.zr.File {
 			if !strings.Contains(file.Name, ":") {
 				continue
 			}
-			path, err := e.absPath(file.Name)
-			if err != nil {
-				return err
+			path := paths[i]
+			if path == "" {
+				continue
 			}
 			if err := e.createFile(parentCtx, path, file, budget); err != nil {
 				return err
@@ -1109,15 +1129,14 @@ func (e *Extractor) extractSolidStream(r io.Reader, eb *entryBudget, ctx context
 			return fmt.Errorf("zip: sequential extraction not supported for method %d with flags %x", method, flags)
 		}
 
-		if e.options.stripComponents > 0 {
-			stripped, ok := stripComponents(name, e.options.stripComponents)
-			if !ok {
-				if err := skipBytes(r, int64(uncompSize), flags); err != nil {
-					return err
-				}
-				continue
+		name, ok := e.strippedName(name)
+		if !ok {
+			// The entry is not being written, but its bytes are still in
+			// the way of the next one.
+			if err := skipBytes(r, int64(uncompSize), flags); err != nil {
+				return err
 			}
-			name = stripped
+			continue
 		}
 
 		path, err := e.absPath(name)
@@ -1764,7 +1783,7 @@ func (e *Extractor) synthesizeParentDirs(targetPath string) error {
 		fi, errStat := os.Lstat(fixOSPath(current))
 		if errStat != nil {
 			if os.IsNotExist(errStat) {
-				if errMk := os.Mkdir(fixOSPath(current), 0755); errMk != nil && !os.IsExist(errMk) {
+				if errMk := mkdir(fixOSPath(current), 0755); errMk != nil && !os.IsExist(errMk) {
 					return errMk
 				}
 			} else {
@@ -1773,7 +1792,7 @@ func (e *Extractor) synthesizeParentDirs(targetPath string) error {
 		} else if !fi.IsDir() {
 			// Resolve conflict: remove blocking file and create directory
 			if errRm := os.Remove(fixOSPath(current)); errRm == nil {
-				if errMk := os.Mkdir(fixOSPath(current), 0755); errMk != nil {
+				if errMk := mkdir(fixOSPath(current), 0755); errMk != nil {
 					return errMk
 				}
 			} else {

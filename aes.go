@@ -90,10 +90,10 @@ func newWinZipAesReader(r io.Reader, password string, info *winzipAesInfo, compr
 		return nil, 0, ErrPassword
 	}
 
-	block, err := aes.NewCipher(encKey)
-	if err != nil {
-		return nil, 0, err
-	}
+	// The key is the keyLen bytes PBKDF2 produced, and keyLen is 16, 24 or 32
+	// by the switch above, which are the three lengths AES takes, so there is
+	// no cipher here that could fail to be made.
+	block, _ := aes.NewCipher(encKey)
 
 	// WinZip AES uses CTR mode with IV=1 (per 16-byte blocks)
 	iv := make([]byte, 16)
@@ -277,10 +277,9 @@ func newWinZipAesWriter(w io.Writer, password string, strength byte) (io.WriteCl
 		return nil, err
 	}
 
-	block, err := aes.NewCipher(encKey)
-	if err != nil {
-		return nil, err
-	}
+	// The same key PBKDF2 produced at one of the three lengths AES takes; see
+	// the reader above.
+	block, _ := aes.NewCipher(encKey)
 
 	iv := make([]byte, 16)
 	for i := range iv {

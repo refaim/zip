@@ -475,8 +475,8 @@ func TestExtractor_IncrementalSweepReturnsARemovalFailure(t *testing.T) {
 func TestExtractor_IncrementalSweepReturnsAnUnopenableDestination(t *testing.T) {
 	rootFailed := errors.New("the destination could not be opened as a root")
 	original := openRoot
-	openRoot = func(string) (*os.Root, error) { return nil, rootFailed }
 	t.Cleanup(func() { openRoot = original })
+	openRoot = func(string) (*os.Root, error) { return nil, rootFailed }
 
 	dst := filepath.Join(t.TempDir(), "dst")
 	mustMkdirAll(t, dst)
