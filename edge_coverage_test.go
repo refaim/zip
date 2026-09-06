@@ -48,7 +48,7 @@ func TestWinZipAes_Edge(t *testing.T) {
 	}
 
 	// То же для ReaderAt
-	_, err = newWinZipAesReaderAt(bytes.NewReader(make([]byte, 20)), "pass", info, 100)
+	_, err = newWinZipAesReaderAt(bytes.NewReader(make([]byte, 20)), "pass", info, 100, true)
 	if err == nil || err.Error() != "zip: unknown AES strength" {
 		t.Errorf("expected unknown strength error for ReaderAt, got %v", err)
 	}

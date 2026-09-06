@@ -141,7 +141,50 @@ type winZipAesReaderAt struct {
 	iv         []byte
 }
 
-func newWinZipAesReaderAt(r io.ReaderAt, password string, info *winzipAesInfo, compressedSize int64) (*winZipAesReaderAt, error) {
+// verifyWinZipAesCode checks the authentication code an entry carries behind
+// its ciphertext against the code the ciphertext that is there produces. The
+// code covers the ciphertext rather than the plaintext, so one sequential pass
+// answers it with nothing decrypted and nothing held: the entry goes through a
+// fixed buffer whatever its size. dataOffset and limit are where the
+// ciphertext begins in r and how long it is; the ten byte code follows it.
+func verifyWinZipAesCode(r io.ReaderAt, authKey []byte, dataOffset, limit int64) error {
+	mac := hmac.New(sha1.New, authKey)
+	// A megabyte at a time rather than the 32 KiB io.Copy would use on its
+	// own: this is a whole entry going past, and the entries the seekable
+	// path exists for are the large ones.
+	n, err := io.CopyBuffer(mac, io.NewSectionReader(r, dataOffset, limit), make([]byte, 1024*1024))
+	if err != nil {
+		return err
+	}
+	stored := make([]byte, 10)
+	_, codeErr := io.ReadFull(io.NewSectionReader(r, dataOffset+limit, 10), stored)
+	if n != limit || codeErr != nil {
+		// The entry stops before the code its header says is behind it,
+		// so there is nothing to check it against. Neither half of this
+		// says so on its own: io.Copy calls a section that ended early a
+		// finished copy, and a code read back from nothing at all comes
+		// out as io.EOF, which a caller reading through this would take
+		// for the clean end of the entry.
+		if codeErr == nil || codeErr == io.EOF {
+			return io.ErrUnexpectedEOF
+		}
+		return codeErr
+	}
+	if !hmac.Equal(mac.Sum(nil)[:10], stored) {
+		// The same failure the sequential reader reports when it reaches
+		// the end of an entry that does not authenticate.
+		return &EncryptedDataError{Err: ErrChecksum}
+	}
+	return nil
+}
+
+// newWinZipAesReaderAt prepares random access to a WinZip AES entry. When
+// verify is set the entry's authentication code is checked before the reader
+// is handed back, which costs one sequential pass over the ciphertext; without
+// it the bytes this reader produces are decrypted but never authenticated, and
+// AES-CTR being malleable, a tampered entry then reads back as whatever the
+// change made of it.
+func newWinZipAesReaderAt(r io.ReaderAt, password string, info *winzipAesInfo, compressedSize int64, verify bool) (*winZipAesReaderAt, error) {
 	if info == nil {
 		return nil, errors.New("zip: AES info missing")
 	}
@@ -177,6 +220,16 @@ func newWinZipAesReaderAt(r io.ReaderAt, password string, info *winzipAesInfo, c
 	limit := compressedSize - int64(saltLen) - 2 - 10
 	if limit < 0 {
 		return nil, errors.New("zip: encrypted data too short")
+	}
+
+	// After the password verifier, so a wrong password is still answered
+	// by the two bytes the format put there for it rather than by a read
+	// of the whole entry.
+	if verify {
+		authKey := keys[keyLen : 2*keyLen]
+		if err := verifyWinZipAesCode(r, authKey, int64(saltLen)+2, limit); err != nil {
+			return nil, err
+		}
 	}
 
 	iv := make([]byte, 16)

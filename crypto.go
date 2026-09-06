@@ -394,9 +394,23 @@ func checkXCryptZip(ra io.ReaderAt, size int64, password string) (io.ReaderAt, i
 		return nil, 0, err
 	}
 	// #nosec G115 -- readDirectoryHeader and salvage both refuse an entry whose CompressedSize64 is above MaxInt64
-	payloadSection := io.NewSectionReader(ra, pOff, int64(payloadFile.CompressedSize64))
-	decReader := newXCryptReaderAt(payloadSection, key, cHdr.IV)
+	payloadSize := int64(payloadFile.CompressedSize64)
 
-	// #nosec G115 -- readDirectoryHeader and salvage both refuse an entry whose CompressedSize64 is above MaxInt64
-	return decReader, int64(payloadFile.CompressedSize64), nil
+	// The encapsulation stored an authentication code over the payload as
+	// it wrote it. Checking it here is what tells a payload that was
+	// modified from one that was not, and it is also what tells a wrong
+	// password from an archive that is not an archive: the wrong key
+	// computes a different code, so the caller hears about the password
+	// rather than about the bytes the wrong key made. The price is a
+	// sequential read of the whole archive before either is reported. The
+	// code covers the stored bytes, so nothing is decrypted for it.
+	mac := hmac.New(sha256.New, key)
+	if _, err := io.CopyBuffer(mac, io.NewSectionReader(ra, pOff, payloadSize), make([]byte, 1024*1024)); err != nil {
+		return nil, 0, err
+	}
+	if !hmac.Equal(mac.Sum(nil), cHdr.MAC) {
+		return nil, 0, &EncryptedDataError{Err: fmt.Errorf("zip: xcrypt authentication code does not match: %w", ErrChecksum)}
+	}
+
+	return newXCryptReaderAt(io.NewSectionReader(ra, pOff, payloadSize), key, cHdr.IV), payloadSize, nil
 }
