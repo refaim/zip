@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"os"
 	"path/filepath"
@@ -693,4 +694,184 @@ func TestWriter_HeaderFieldsOverTheFormatLimit(t *testing.T) {
 		fh.Extra = make([]byte, uint16max+1)
 		requireFieldTooLong(t, zw.Close(), "extra field")
 	})
+}
+
+// TestWriter_MalformedExtraIsRefused: the extra field area is a run of
+// records, and everything the writer adds to an entry goes behind whatever the
+// caller put there. A reader walks the area from the front and stops at the
+// first record it cannot walk past, so an area that is not a well formed run
+// hides every record the writer added: an AES entry came back marked encrypted
+// with no record naming the salt and the strength it was encrypted under, and
+// its payload was unrecoverable. One stray byte was enough, and both the
+// header and the close reported success.
+func TestWriter_MalformedExtraIsRefused(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		extra []byte
+		want  string
+	}{
+		{"one stray byte", []byte("0"), "ends 1 bytes into the four"},
+		{"three stray bytes", []byte("012"), "ends 3 bytes into the four"},
+		{"a record longer than the area", []byte{0x99, 0x99, 0x10, 0x00, 0x01}, "declares 16 bytes and 1 are left"},
+		{"a stray byte behind a whole record", append(xcryptTagExtra(), 0x00), "ends 1 bytes into the four"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			zw := NewWriter(new(bytes.Buffer))
+			_, err := zw.CreateHeader(&FileHeader{
+				Name:        "a.txt",
+				Method:      Store,
+				Extra:       append([]byte(nil), tc.extra...),
+				Password:    "pw",
+				AESStrength: 3,
+			})
+			if err == nil {
+				t.Fatal("an entry was started with an extra field area no reader can walk")
+			}
+			if !errors.Is(err, ErrFormat) {
+				t.Errorf("the header was refused with %v, want an ErrFormat", err)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("the error is %q, want it to say %q", err, tc.want)
+			}
+		})
+	}
+}
+
+// TestWriter_WellFormedExtraKeepsTheEncryptionRecord is the other half: an
+// area that is a run of records leaves the record the writer adds behind it
+// where a reader can reach it, and the entry reads back.
+func TestWriter_WellFormedExtraKeepsTheEncryptionRecord(t *testing.T) {
+	const password = "pw"
+	body := []byte("secret")
+
+	buf := new(bytes.Buffer)
+	zw := NewWriter(buf)
+	fh := &FileHeader{
+		Name:        "a.txt",
+		Method:      Store,
+		Extra:       xcryptTagExtra(),
+		Password:    password,
+		AESStrength: 3,
+	}
+	mustWrite(t, mustCreateHeader(t, zw, fh), body)
+	if err := zw.Close(); err != nil {
+		t.Fatalf("closing the writer: %v", err)
+	}
+
+	zr, err := NewReaderWithPassword(bytes.NewReader(buf.Bytes()), int64(buf.Len()), password)
+	if err != nil {
+		t.Fatalf("reading the archive back: %v", err)
+	}
+	rc, err := zr.File[0].Open()
+	if err != nil {
+		t.Fatalf("opening the entry: %v", err)
+	}
+	closeAt(t, rc)
+	got, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatalf("reading the entry: %v", err)
+	}
+	if !bytes.Equal(got, body) {
+		t.Errorf("the entry holds %q, want %q", got, body)
+	}
+}
+
+// TestUpdater_MalformedExtraIsRefused: the same guard on the other write path.
+func TestUpdater_MalformedExtraIsRefused(t *testing.T) {
+	raw := oneEntryArchive(t, "keep.txt", []byte("kept"))
+	u, err := NewUpdater(&memFile{data: raw})
+	if err != nil {
+		t.Fatalf("opening the updater: %v", err)
+	}
+	_, err = u.AppendHeader(&FileHeader{
+		Name:   "added.txt",
+		Method: Store,
+		Extra:  []byte("0"),
+	}, APPEND_MODE_OVERWRITE)
+	if err == nil {
+		t.Fatal("an entry was appended with an extra field area no reader can walk")
+	}
+	if !errors.Is(err, ErrFormat) {
+		t.Errorf("the append was refused with %v, want an ErrFormat", err)
+	}
+}
+
+// TestWriter_TrailingBackslashNameIsRefused: a reader rewrites every backslash
+// in a name to a forward slash, which is right for the separators a Windows
+// archive carries inside a path and wrong at the end of one -- a trailing
+// forward slash is how the format says the entry is a directory. So an entry
+// this writer wrote as `a\` came back as the directory `a/`, and the reader
+// answered its content with ErrFormat: an archive this package produced
+// without complaint and could not read.
+func TestWriter_TrailingBackslashNameIsRefused(t *testing.T) {
+	for _, name := range []string{`\`, `a\`, `dir\sub\`} {
+		t.Run(name, func(t *testing.T) {
+			zw := NewWriter(new(bytes.Buffer))
+			_, err := zw.CreateHeader(&FileHeader{Name: name, Method: Deflate})
+			if err == nil {
+				t.Fatalf("an entry was started under the name %q", name)
+			}
+			if !errors.Is(err, ErrFormat) {
+				t.Errorf("the header was refused with %v, want an ErrFormat", err)
+			}
+			if !strings.Contains(err.Error(), "backslash") {
+				t.Errorf("the error is %q, want it to say what is wrong with the name", err)
+			}
+			// Create takes the same route, so it answers the same way.
+			if _, cerr := zw.Create(name); !errors.Is(cerr, ErrFormat) {
+				t.Errorf("Create(%q) gave %v, want an ErrFormat", name, cerr)
+			}
+		})
+	}
+}
+
+// TestUpdater_TrailingBackslashNameIsRefused: the same guard on the other
+// write path.
+func TestUpdater_TrailingBackslashNameIsRefused(t *testing.T) {
+	raw := oneEntryArchive(t, "keep.txt", []byte("kept"))
+	u, err := NewUpdater(&memFile{data: raw})
+	if err != nil {
+		t.Fatalf("opening the updater: %v", err)
+	}
+	if _, err := u.AppendHeader(&FileHeader{Name: `a\`, Method: Store}, APPEND_MODE_OVERWRITE); !errors.Is(err, ErrFormat) {
+		t.Fatalf("appending an entry named %q gave %v, want an ErrFormat", `a\`, err)
+	}
+}
+
+// TestReader_TrailingBackslashFromAnotherProducerIsADirectory is the other
+// half, and the reason the name is refused on the way in rather than repaired
+// on the way out: an archive from elsewhere that carries such a name reads as
+// the directory the rewrite makes of it, and it has to go on doing so. The
+// rewrite is what makes a Windows-style path readable at all, and by the time
+// anything looks at the name it has already happened.
+func TestReader_TrailingBackslashFromAnotherProducerIsADirectory(t *testing.T) {
+	body := []byte("bytes stored under a name ending in a backslash")
+	// CreateRaw writes the header it is given as it stands, which is how
+	// another producer's archive is spelled here.
+	raw := rawEntryArchive(t, &FileHeader{
+		Name:               `a\`,
+		Method:             Store,
+		CRC32:              crc32.ChecksumIEEE(body),
+		CompressedSize64:   uint64(len(body)),
+		UncompressedSize64: uint64(len(body)),
+	}, body)
+
+	zr, err := NewReader(bytes.NewReader(raw), int64(len(raw)))
+	if err != nil {
+		t.Fatalf("reading the archive back: %v", err)
+	}
+	if len(zr.File) != 1 {
+		t.Fatalf("the archive holds %d entries, want 1", len(zr.File))
+	}
+	if got := zr.File[0].Name; got != "a/" {
+		t.Fatalf("the entry came back named %q, want %q", got, "a/")
+	}
+	rc, err := zr.File[0].Open()
+	if err != nil {
+		t.Fatalf("opening the entry: %v", err)
+	}
+	closeAt(t, rc)
+	if _, err := io.ReadAll(rc); !errors.Is(err, ErrFormat) {
+		t.Errorf("reading a directory entry that declares a size gave %v, want an ErrFormat", err)
+	}
 }

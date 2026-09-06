@@ -808,15 +808,10 @@ func TestEntryBudget_PreallocSize(t *testing.T) {
 	}
 }
 
-// TestExtractor_SolidStreamSizeLimit: a solid archive is unpacked by a path of
-// its own, which used to consult neither limit, so an archive that named
-// itself Solid.zip was exempt from both.
-//
-// The refusal is also the end of it. The fallback exists for a stream the
-// unpack could not read, and a limit says the opposite -- that it was read and
-// is not allowed -- so falling through to it copies the whole entry to a temp
-// file to arrive at the same answer.
-func TestExtractor_SolidStreamSizeLimit(t *testing.T) {
+// TestExtractor_SolidSizeLimit: a solid archive is unpacked by a path of its
+// own, which used to consult neither limit, so an archive that named itself
+// Solid.zip was exempt from both.
+func TestExtractor_SolidSizeLimit(t *testing.T) {
 	const limit = 1 << 20
 	raw := solidArchive(t, Store, func(inner *Writer) {
 		storedEntry(t, inner, "big.bin", make([]byte, 2*limit))
@@ -840,9 +835,10 @@ func TestExtractor_SolidStreamSizeLimit(t *testing.T) {
 func TestExtractor_SolidFallbackScratchIsNotAnExtractedFile(t *testing.T) {
 	const limit = 4096
 	const part = 2000
-	raw := solidArchive(t, Store, func(inner *Writer) {
-		// Deflate, so the streaming unpack gives up and the fallback runs.
-		w, err := inner.Create("refused.txt")
+	// Compressed, so that the entry has to be copied out before it can be
+	// read and the copy is the file this is about.
+	raw := solidArchive(t, Deflate, func(inner *Writer) {
+		w, err := inner.Create("deflated.txt")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -890,9 +886,6 @@ func TestExtractor_SolidFallbackScratchIsNotAnExtractedFile(t *testing.T) {
 // own true ratio.
 func TestExtractor_SolidFallbackRatioNotDoubleCharged(t *testing.T) {
 	raw := solidArchive(t, Deflate, func(inner *Writer) {
-		// Streamed out in full before the entry the unpack refuses, so
-		// the first pass has charged the budget by the time the second
-		// one starts.
 		storedEntry(t, inner, "zeros.bin", make([]byte, 64<<10))
 		w, err := inner.Create("refused.txt")
 		if err != nil {
@@ -987,7 +980,7 @@ func TestExtractBudget_FallbackTooLarge(t *testing.T) {
 	}
 }
 
-func TestExtractor_SolidStreamRatioLimit(t *testing.T) {
+func TestExtractor_SolidRatioLimit(t *testing.T) {
 	raw := solidArchive(t, Deflate, func(inner *Writer) {
 		storedEntry(t, inner, "zeros.bin", make([]byte, 512<<10))
 	})
@@ -999,12 +992,10 @@ func TestExtractor_SolidStreamRatioLimit(t *testing.T) {
 }
 
 // TestExtractor_SolidFallbackRatioLimit covers the other half of the solid
-// path: an inner entry the streaming unpack refuses sends the whole solid
-// entry to a temp file first, and that copy was unbounded.
+// path: a compressed solid entry goes to a temp file before it can be read at
+// all, and that copy was unbounded.
 func TestExtractor_SolidFallbackRatioLimit(t *testing.T) {
 	raw := solidArchive(t, Deflate, func(inner *Writer) {
-		// Deflate, so the streaming unpack gives up before writing
-		// anything and the fallback takes over.
 		w, err := inner.Create("refused.txt")
 		if err != nil {
 			t.Fatal(err)

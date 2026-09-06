@@ -15,7 +15,10 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
+	"strings"
 	"testing"
+	"time"
 )
 
 // XCrypt encrypts a whole archive rather than its entries: the archive that
@@ -601,6 +604,8 @@ func TestParseXCryptHeader_RejectsMalformedHeaders(t *testing.T) {
 		{"a version from the future", mutate(func(b []byte) { b[6] = 2 })},
 		{"an unknown key derivation", mutate(func(b []byte) { b[7] = 2 })},
 		{"an unknown cipher", mutate(func(b []byte) { b[8] = 2 })},
+		{"no key derivation at all", mutate(func(b []byte) { binary.LittleEndian.PutUint32(b[9:13], 0) })},
+		{"more iterations than any writer produces", mutate(func(b []byte) { binary.LittleEndian.PutUint32(b[9:13], 0xffffffff) })},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			hdr, err := parseXCryptHeader(tc.data)
@@ -611,6 +616,46 @@ func TestParseXCryptHeader_RejectsMalformedHeaders(t *testing.T) {
 				t.Error("a rejected header was still handed back")
 			}
 		})
+	}
+}
+
+// TestXCrypt_OpenIsNotHeldByTheIterationCountAnArchiveNames: the header names
+// how many rounds of key derivation the archive wants, and the field holds
+// four billion of them. Spending that on an archive's say-so means a few
+// hundred bytes hold the caller for hours on one core, with a wrong password
+// costing exactly as much as a right one and no way to give up part way
+// through. The count is refused where the header is parsed, before the key
+// derivation is reached.
+func TestXCrypt_OpenIsNotHeldByTheIterationCountAnArchiveNames(t *testing.T) {
+	raw := xcryptOuterArchive(t, xcryptOuterSpec{
+		header: (&XCryptHeader{
+			Version: 1, KdfAlgo: 1, Cipher: 1, Iterations: 0xffffffff,
+			Salt: bytes.Repeat([]byte{1}, 32),
+			IV:   bytes.Repeat([]byte{2}, 16),
+			MAC:  bytes.Repeat([]byte{3}, 32),
+		}).Encode(),
+		payload:      make([]byte, 64),
+		payloadExtra: xcryptTagExtra(),
+	})
+
+	// The open runs on its own goroutine so that a regression fails this
+	// test rather than holding the whole suite until its timeout.
+	done := make(chan error, 1)
+	go func() {
+		_, err := NewReaderWithPassword(bytes.NewReader(raw), int64(len(raw)), "not the password")
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrFormat) {
+			t.Fatalf("opening the archive gave %v, want it refused as a malformed archive", err)
+		}
+		if !strings.Contains(err.Error(), strconv.Itoa(maxXCryptIterations)) {
+			t.Errorf("the error is %q, want it to name the ceiling", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatalf("opening a %d byte archive had not answered after 30s; its header asked for %d rounds of key derivation", len(raw), uint32(0xffffffff))
 	}
 }
 
@@ -842,6 +887,57 @@ func TestXCrypt_ReaderAtSwallowsAFullReadsEOF(t *testing.T) {
 	if !bytes.Equal(buf, plain[len(plain)-16:]) {
 		t.Error("the last block did not decrypt to what was encrypted")
 	}
+}
+
+// xcryptSilentShortReaderAt hands back nothing and says nothing about it,
+// which no io.ReaderAt is allowed to do and which the reader below must not
+// turn into a successful read of zero bytes.
+type xcryptSilentShortReaderAt struct{}
+
+func (xcryptSilentShortReaderAt) ReadAt([]byte, int64) (int, error) { return 0, nil }
+
+// TestXCrypt_ReaderAtRefusesAReadPastTheStream: a read is served from the
+// cipher block the offset lands in, so the bytes in front of that offset come
+// back too and are dropped. When the stream ends inside that block there are
+// fewer of them than the offset asks to drop, and dropping them anyway ran off
+// the end of the buffer.
+func TestXCrypt_ReaderAtRefusesAReadPastTheStream(t *testing.T) {
+	key := bytes.Repeat([]byte{0x33}, 32)
+	iv := bytes.Repeat([]byte{0x44}, 16)
+
+	for _, tc := range []struct {
+		name    string
+		payload int
+		off     int64
+		want    int
+	}{
+		{"an offset past a stream shorter than one block", 3, 4, 0},
+		{"an offset one byte past the stream", 17, 18, 0},
+		{"an offset inside the block the stream ends in", 20, 21, 0},
+		{"an offset the stream still reaches", 32, 20, 12},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ra := newXCryptReaderAt(bytes.NewReader(make([]byte, tc.payload)), key, iv)
+			n, err := ra.ReadAt(make([]byte, 16), tc.off)
+			if n != tc.want {
+				t.Errorf("read %d bytes at offset %d of a %d byte stream, want %d", n, tc.off, tc.payload, tc.want)
+			}
+			if err == nil {
+				t.Errorf("a read that came back %d bytes short reported no error", 16-n)
+			}
+		})
+	}
+
+	t.Run("an underlying reader that returns nothing and no error", func(t *testing.T) {
+		ra := newXCryptReaderAt(xcryptSilentShortReaderAt{}, key, iv)
+		n, err := ra.ReadAt(make([]byte, 16), 4)
+		if n != 0 {
+			t.Errorf("read %d bytes from a reader that handed back none", n)
+		}
+		if !errors.Is(err, io.ErrUnexpectedEOF) {
+			t.Errorf("the read reported %v, want io.ErrUnexpectedEOF", err)
+		}
+	})
 }
 
 // TestXCrypt_ReaderAtRejectsAnUnusableKey: a key AES cannot take is reported

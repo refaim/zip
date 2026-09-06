@@ -8,6 +8,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"testing"
+
+	"github.com/klauspost/compress/flate"
 )
 
 func TestDeflate64_Registration(t *testing.T) {
@@ -131,5 +133,124 @@ func TestInputBuffer_CopyToDrainsBitBuffer(t *testing.T) {
 	}
 	if in.readBytes != 4 {
 		t.Errorf("copyTo accounted for %d read bytes, want 4", in.readBytes)
+	}
+}
+
+// deflate64BitBuf lays out a deflate stream by hand: header fields go in
+// least significant bit first, Huffman codes most significant bit first.
+type deflate64BitBuf struct {
+	out   []byte
+	accum uint32
+	nbits uint
+}
+
+// field writes count bits of value, low bit first, which is how the format
+// spells everything that is not a Huffman code.
+func (b *deflate64BitBuf) field(value uint32, count uint) {
+	for i := uint(0); i < count; i++ {
+		b.accum |= ((value >> i) & 1) << b.nbits
+		b.nbits++
+		if b.nbits == 8 {
+			// #nosec G115 -- the accumulator is emitted a byte at a time, so taking its low eight bits is the operation itself
+			b.out = append(b.out, byte(b.accum))
+			b.accum, b.nbits = 0, 0
+		}
+	}
+}
+
+// code writes a Huffman code of count bits, high bit first.
+func (b *deflate64BitBuf) code(value uint32, count uint) {
+	for i := count; i > 0; i-- {
+		b.field((value>>(i-1))&1, 1)
+	}
+}
+
+func (b *deflate64BitBuf) bytes() []byte {
+	if b.nbits > 0 {
+		// #nosec G115 -- as above: the trailing partial byte is the low eight bits of the accumulator
+		return append(b.out, byte(b.accum))
+	}
+	return b.out
+}
+
+// TestDeflate64_MatchBeforeTheStartOfTheOutputIsRefused: a match names how far
+// back to copy from, and the window it copies out of is zeroed to begin with.
+// A distance reaching past the start of the stream therefore used to produce
+// zeros the stream never carried -- a file of plausible length, part of it
+// invented, with nothing reported. The standard library's decoder refuses such
+// a stream, and this is where.
+func TestDeflate64_MatchBeforeTheStartOfTheOutputIsRefused(t *testing.T) {
+	var b deflate64BitBuf
+	b.field(1, 1) // final block
+	b.field(1, 2) // fixed Huffman codes
+	// One literal, 'A': the fixed table spells 0..143 in eight bits from
+	// 0x30 up.
+	b.code(0x30+'A', 8)
+	// Length code 257, which is a match of three bytes and carries no extra
+	// bits: the fixed table spells 256..279 in seven bits from zero up.
+	b.code(257-256, 7)
+	// Distance code 2, which is a distance of three -- two bytes further
+	// back than the one byte produced so far. Distances are five bit codes.
+	b.code(2, 5)
+	b.code(endOfBlockCode-256, 7)
+	raw := b.bytes()
+
+	dec := decodeDeflate64(bytes.NewReader(raw))
+	got, err := io.ReadAll(dec)
+	if cerr := dec.Close(); err == nil {
+		err = cerr
+	}
+	if err == nil {
+		t.Fatalf("a match reaching before the start of the stream produced %q and reported nothing", got)
+	}
+	if !errors.Is(err, errDataError) {
+		t.Errorf("the stream was refused with %v, want %v", err, errDataError)
+	}
+
+	// The standard library's decoder is the second opinion on the same
+	// bytes: they are an ordinary deflate stream, and it refuses them too.
+	fr := flate.NewReader(bytes.NewReader(raw))
+	_, ferr := io.ReadAll(fr)
+	if cerr := fr.Close(); ferr == nil {
+		ferr = cerr
+	}
+	if ferr == nil {
+		t.Error("the standard library's decoder accepted the same stream")
+	}
+}
+
+// TestDeflate64_MatchBeforeTheStartOfTheOutputIsRefusedInTheFastPath is the
+// same stream where the decoder takes its unrolled path: with eight bytes of
+// input still in hand and room in the window, a block is decoded by a loop
+// that reads symbols without checking for more input between them, and the
+// bound on how far back a match may reach has to hold there too.
+func TestDeflate64_MatchBeforeTheStartOfTheOutputIsRefusedInTheFastPath(t *testing.T) {
+	var b deflate64BitBuf
+	b.field(1, 1) // final block
+	b.field(1, 2) // fixed Huffman codes
+	// Thirty literals, so that the loop below has produced something and
+	// the input is still long enough to stay on the unrolled path.
+	for i := 0; i < 30; i++ {
+		b.code(0x30+'A', 8)
+	}
+	b.code(257-256, 7) // a match of three bytes, no extra bits
+	b.code(10, 5)      // distance code 10, whose base is 33
+	b.field(0, 4)      // its four extra bits, all zero: a distance of 33
+	b.code(endOfBlockCode-256, 7)
+	raw := b.bytes()
+	// Trailing bytes nothing reads, so that the unrolled loop still sees
+	// eight bytes of input when it reaches the match.
+	raw = append(raw, make([]byte, 32)...)
+
+	dec := decodeDeflate64(bytes.NewReader(raw))
+	got, err := io.ReadAll(dec)
+	if cerr := dec.Close(); err == nil {
+		err = cerr
+	}
+	if err == nil {
+		t.Fatalf("a match reaching before the start of the stream produced %q and reported nothing", got)
+	}
+	if !errors.Is(err, errDataError) {
+		t.Errorf("the stream was refused with %v, want %v", err, errDataError)
 	}
 }

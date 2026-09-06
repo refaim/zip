@@ -831,8 +831,8 @@ func extractorCovInnerBytes(e extractorCovInner) []byte {
 }
 
 // extractorCovStored describes an inner entry whose header carries the sizes
-// and the checksum of the bytes it holds, which is what the streaming pass
-// needs to read it as it arrives.
+// and the checksum of the bytes it holds, which is what a reader needs to
+// salvage it from a local header.
 func extractorCovStored(name string, data []byte) extractorCovInner {
 	return extractorCovInner{
 		name:   name,
@@ -846,8 +846,8 @@ func extractorCovStored(name string, data []byte) extractorCovInner {
 	}
 }
 
-// extractorCovCentral is the four bytes that tell the streaming pass it has
-// reached the central directory and there are no more entries.
+// extractorCovCentral is the four bytes that end the run of local headers,
+// where a central directory would begin.
 func extractorCovCentral() []byte {
 	end := make([]byte, 4)
 	binary.LittleEndian.PutUint32(end, directoryHeaderSignature)
@@ -872,7 +872,7 @@ func extractorCovInnerStream(entries ...extractorCovInner) []byte {
 	return body
 }
 
-func TestExtractorCovSolidStreamStopsAtTheEndOfTheStream(t *testing.T) {
+func TestExtractorCovSolidStopsAtTheEndOfTheStream(t *testing.T) {
 	// A stream that simply runs out where an entry would begin has no more
 	// entries, which is the same answer as a central directory there.
 	body := extractorCovInnerStream(extractorCovStored("entry.bin", []byte("contents")))
@@ -889,7 +889,7 @@ func TestExtractorCovSolidStreamStopsAtTheEndOfTheStream(t *testing.T) {
 	}
 }
 
-func TestExtractorCovSolidStreamStopsOnAPartialSignature(t *testing.T) {
+func TestExtractorCovSolidStopsOnAPartialSignature(t *testing.T) {
 	// The same for a stream that stops in the middle of the four bytes an
 	// entry begins with.
 	body := extractorCovInnerStream(extractorCovStored("entry.bin", []byte("contents")))
@@ -899,7 +899,7 @@ func TestExtractorCovSolidStreamStopsOnAPartialSignature(t *testing.T) {
 	}
 }
 
-func TestExtractorCovSolidStreamUnreadableAtAnEntryBoundary(t *testing.T) {
+func TestExtractorCovSolidUnreadableAtAnEntryBoundary(t *testing.T) {
 	// The solid entry's own checksum is checked as its last bytes are read,
 	// so an entry that does not match reports it where the pass asks for the
 	// next inner entry.
@@ -910,7 +910,7 @@ func TestExtractorCovSolidStreamUnreadableAtAnEntryBoundary(t *testing.T) {
 	}
 }
 
-func TestExtractorCovSolidStreamHeaderTruncated(t *testing.T) {
+func TestExtractorCovSolidHeaderTruncated(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
 		entry extractorCovInner
@@ -939,10 +939,9 @@ func TestExtractorCovSolidStreamHeaderTruncated(t *testing.T) {
 	}
 }
 
-func TestExtractorCovSolidStreamNameEscapesTheDestination(t *testing.T) {
-	// The inner names are read from the local headers rather than from a
-	// central directory, so they are resolved against the destination here
-	// and refused here.
+func TestExtractorCovSolidNameEscapesTheDestination(t *testing.T) {
+	// An inner name is resolved against the destination like any other, so
+	// one that resolves outside it is refused there.
 	body := extractorCovInnerStream(extractorCovStored("../escape.txt", []byte("x")))
 	body = append(body, extractorCovCentral()...)
 	_, err := extractorCovExtract(t, extractorCovSolid(t, body, false))
@@ -951,7 +950,7 @@ func TestExtractorCovSolidStreamNameEscapesTheDestination(t *testing.T) {
 	}
 }
 
-func TestExtractorCovSolidStreamParentChainRunsThroughAFile(t *testing.T) {
+func TestExtractorCovSolidParentChainRunsThroughAFile(t *testing.T) {
 	// A file the inner archive wrote a moment ago standing where a later
 	// entry's parent belongs.
 	if runtime.GOOS == "windows" {
@@ -967,10 +966,10 @@ func TestExtractorCovSolidStreamParentChainRunsThroughAFile(t *testing.T) {
 	}
 }
 
-func TestExtractorCovSolidStreamStripsComponents(t *testing.T) {
+func TestExtractorCovSolidStripsComponents(t *testing.T) {
 	// Stripping applies to the inner names too: an entry with nothing left
-	// after the strip is passed over, bytes and data descriptor and all, and
-	// one with something left is written under what is left.
+	// after the strip is not written at all, and one with something left is
+	// written under what is left.
 	body := extractorCovInnerStream(
 		extractorCovStored("skipped.txt", []byte("passed over")),
 		extractorCovStored("dir/kept.txt", []byte("kept")),
@@ -994,11 +993,10 @@ func TestExtractorCovSolidStreamStripsComponents(t *testing.T) {
 	}
 }
 
-func TestExtractorCovSolidStreamSkippedEntryTruncated(t *testing.T) {
-	// The bytes of a passed-over entry still have to be stepped over, and a
-	// stream that has fewer of them than the header claims cannot be stepped
-	// through to the next entry. The solid entry's own checksum is what the
-	// step runs into here, since stepping reads the entry to its end.
+func TestExtractorCovSolidSkippedEntryTruncated(t *testing.T) {
+	// An entry that declares more bytes than the archive holds cannot be
+	// read through to the end. The solid entry's own checksum is what the
+	// attempt runs into here, since reading it reaches the end of the entry.
 	e := extractorCovStored("skipped.txt", []byte("only some of it"))
 	e.uncomp = 4096
 	e.comp = 4096
@@ -1010,7 +1008,7 @@ func TestExtractorCovSolidStreamSkippedEntryTruncated(t *testing.T) {
 	}
 }
 
-func TestExtractorCovSolidStreamExtraFieldTruncated(t *testing.T) {
+func TestExtractorCovSolidExtraFieldTruncated(t *testing.T) {
 	// An extra field that says it is longer than what is left of the field
 	// area ends the reading of them; the entry itself is still extracted.
 	e := extractorCovStored("entry.bin", []byte("contents"))
@@ -1037,7 +1035,7 @@ func extractorCovXattrExtra(field []byte) []byte {
 	return append(out, field...)
 }
 
-func TestExtractorCovSolidStreamXattrs(t *testing.T) {
+func TestExtractorCovSolidXattrs(t *testing.T) {
 	pair := []byte{0x01, 0x00, 'a', 0x01, 0x00, 'b'}
 	truncatedKey := []byte{0x10, 0x00, 'a', 'b', 'c', 'd'}
 	truncatedValue := []byte{0x01, 0x00, 'a', 0x10, 0x00}
@@ -1079,47 +1077,7 @@ func extractorCovDescriptor(signature uint32, fields int) []byte {
 	return out
 }
 
-func TestExtractorCovSolidStreamDataDescriptors(t *testing.T) {
-	// An entry whose sizes were deferred is followed by a descriptor whose
-	// length depends on whether it carries a signature and on whether the
-	// entry declared itself too large for the 32-bit fields.
-	const notADescriptor = 0x01020304
-	for _, tc := range []struct {
-		name    string
-		zip64   bool
-		trailer []byte
-	}{
-		{"signed and 64-bit", true, extractorCovDescriptor(dataDescriptorSignature, 20)},
-		{"unsigned and 64-bit", true, extractorCovDescriptor(notADescriptor, 16)},
-		{"unsigned and 32-bit", false, extractorCovDescriptor(notADescriptor, 8)},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			e := extractorCovStored("entry.bin", []byte("data"))
-			e.flags = 0x8
-			e.crc = 0
-			if tc.zip64 {
-				e.comp = 0xFFFFFFFF
-			}
-			e.trailer = tc.trailer
-			body := extractorCovInnerStream(e)
-			body = append(body, extractorCovCentral()...)
-
-			dst, err := extractorCovExtract(t, extractorCovSolid(t, body, false))
-			if err != nil {
-				t.Fatalf("extraction failed: %v", err)
-			}
-			data, rerr := os.ReadFile(filepath.Join(dst, "entry.bin"))
-			if rerr != nil {
-				t.Fatalf("the entry was not extracted: %v", rerr)
-			}
-			if string(data) != "data" {
-				t.Errorf("entry.bin = %q, want %q", data, "data")
-			}
-		})
-	}
-}
-
-func TestExtractorCovSolidStreamDescriptorTruncated(t *testing.T) {
+func TestExtractorCovSolidDescriptorTruncated(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
 		trailer []byte
@@ -1140,10 +1098,10 @@ func TestExtractorCovSolidStreamDescriptorTruncated(t *testing.T) {
 	}
 }
 
-func TestExtractorCovSolidStreamStopsOnCancellation(t *testing.T) {
-	// The streaming pass asks whether the extraction is still wanted before
-	// every inner entry, and the fallback that copies the entry out asks the
-	// same before every block it copies.
+func TestExtractorCovSolidStopsOnCancellation(t *testing.T) {
+	// The extraction asks whether it is still wanted before every entry it
+	// writes, and the fallback that copies a solid entry out asks the same
+	// before every block it copies.
 	body := extractorCovInnerStream(extractorCovStored("entry.bin", []byte("contents")))
 	body = append(body, extractorCovCentral()...)
 	raw := extractorCovSolid(t, body, false)
@@ -1160,83 +1118,6 @@ func TestExtractorCovSolidStreamStopsOnCancellation(t *testing.T) {
 	if err := e.Extract(ctx); !errors.Is(err, context.Canceled) {
 		t.Fatalf("the extraction returned %v, want the cancellation", err)
 	}
-}
-
-// --- stepping over the bytes of a passed-over entry ------------------------
-
-// extractorCovFill is a reader that produces the number of bytes asked of it
-// without touching the buffer, and then the tail. It stands in for an inner
-// entry that declares four gigabytes: what the step over it does with the
-// bytes is discard them, and producing them for real would only be slower.
-type extractorCovFill struct {
-	remaining int64
-	tail      []byte
-}
-
-func (r *extractorCovFill) Read(p []byte) (int, error) {
-	if r.remaining > 0 {
-		n := int64(len(p))
-		if n > r.remaining {
-			n = r.remaining
-		}
-		r.remaining -= n
-		return int(n), nil
-	}
-	if len(r.tail) == 0 {
-		return 0, io.EOF
-	}
-	n := copy(p, r.tail)
-	r.tail = r.tail[n:]
-	return n, nil
-}
-
-func TestExtractorCovSkipBytes(t *testing.T) {
-	const notADescriptor = 0x01020304
-	const large = int64(uint32max)
-
-	t.Run("no descriptor to step over", func(t *testing.T) {
-		if err := skipBytes(bytes.NewReader(make([]byte, 8)), 8, 0); err != nil {
-			t.Fatalf("stepping over eight bytes returned %v", err)
-		}
-	})
-
-	t.Run("fewer bytes than the entry declared", func(t *testing.T) {
-		if err := skipBytes(bytes.NewReader(make([]byte, 4)), 8, 0); err == nil {
-			t.Fatal("a stream too short to step over the entry was stepped over anyway")
-		}
-	})
-
-	for _, tc := range []struct {
-		name   string
-		n      int64
-		sig    uint32
-		fields int
-	}{
-		{"signed and 32-bit", 8, dataDescriptorSignature, 12},
-		{"signed and 64-bit", large, dataDescriptorSignature, 20},
-		{"unsigned and 32-bit", 8, notADescriptor, 8},
-		{"unsigned and 64-bit", large, notADescriptor, 16},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			r := &extractorCovFill{remaining: tc.n, tail: extractorCovDescriptor(tc.sig, tc.fields)}
-			if err := skipBytes(r, tc.n, 0x8); err != nil {
-				t.Fatalf("stepping over the entry and its descriptor returned %v", err)
-			}
-		})
-	}
-
-	t.Run("no descriptor where one was promised", func(t *testing.T) {
-		if err := skipBytes(bytes.NewReader(make([]byte, 8)), 8, 0x8); err == nil {
-			t.Fatal("a missing descriptor was stepped over anyway")
-		}
-	})
-
-	t.Run("a descriptor that stops after its signature", func(t *testing.T) {
-		r := bytes.NewReader(append(make([]byte, 8), extractorCovDescriptor(dataDescriptorSignature, 2)...))
-		if err := skipBytes(r, 8, 0x8); err == nil {
-			t.Fatal("a descriptor that stops in the middle was stepped over anyway")
-		}
-	})
 }
 
 // --- a directory the destination will not take ----------------------------
@@ -1294,25 +1175,6 @@ func TestExtractorCovEntryResolvesOutsideTheDestination(t *testing.T) {
 	}
 	if _, serr := os.Lstat(filepath.Join(base, "entry.bin")); !os.IsNotExist(serr) {
 		t.Errorf("the entry was written outside the destination anyway: %v", serr)
-	}
-}
-
-func TestExtractorCovSolidEntryResolvesOutsideTheDestination(t *testing.T) {
-	// The same guard on the streaming pass, which resolves the inner names
-	// itself. The solid entry's checksum is wrong so that the fallback, which
-	// copies the entry out and extracts the copy, has nothing to recover with
-	// and the streaming pass's answer is the one that comes back.
-	body := extractorCovInnerStream(extractorCovStored("entry.bin", []byte("contents")))
-	body = append(body, extractorCovCentral()...)
-	raw := extractorCovSolid(t, body, true)
-	base := t.TempDir()
-
-	err := extractorCovOverDestination(t, raw, extractorCovUnclean(base))
-	if err == nil || !strings.Contains(err.Error(), "outside of chroot") {
-		t.Fatalf("the extraction returned %v, want a refusal to write outside the destination", err)
-	}
-	if _, serr := os.Lstat(filepath.Join(base, "entry.bin")); !os.IsNotExist(serr) {
-		t.Errorf("the inner entry was written outside the destination anyway: %v", serr)
 	}
 }
 

@@ -44,8 +44,20 @@ var lengthExtraBits32 = []uint8{
 
 // In Deflate64, length codes 257-284 are identical.
 // But code 285 has 16 extra bits and encodes lengths from 3 to 65538.
-var lengthBase64 = append(lengthBase32[:28], 3)
-var lengthExtraBits64 = append(lengthExtraBits32[:28], 16)
+//
+// Each table is built in a buffer of its own. Appending onto a slice of the
+// Deflate table writes into the table itself instead -- a slice of a slice has
+// the rest of it as spare room -- so the two tables shared their last slot and
+// Deflate lost its 258 byte maximum match at package initialisation.
+var lengthBase64 = appendLast(lengthBase32[:28], 3)
+var lengthExtraBits64 = appendLast(lengthExtraBits32[:28], 16)
+
+// appendLast returns head with last behind it, in storage of its own.
+func appendLast[T any](head []T, last T) []T {
+	out := make([]T, len(head), len(head)+1)
+	copy(out, head)
+	return append(out, last)
+}
 
 // distanceBase - base distance values (codes 0-31)
 // Deflate uses 0-29. Deflate64 uses 0-31.

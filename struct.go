@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"os"
 	"path"
+	"strings"
 	"time"
 )
 
@@ -259,6 +260,49 @@ func timeToMsDosTime(t time.Time) (fDate uint16, fTime uint16) {
 	// #nosec G115 -- APPNOTE 4.4.6: the MS-DOS time is a 16-bit field holding two-second units, minutes and hours, all of which fit by construction
 	fTime = uint16(t.Second()/2 + t.Minute()<<5 + t.Hour()<<11)
 	return
+}
+
+// validateName reports whether name can be written as it stands.
+//
+// A reader rewrites every backslash in a name to a forward slash, which is the
+// right thing for the separators a Windows archive carries inside a path. At
+// the end of a name it changes what the entry is: a trailing forward slash is
+// how the format says "directory", so an entry named `a\` comes back as the
+// directory `a/` and its content is refused. Nothing tells it apart from a
+// directory entry afterwards -- the rewrite has already happened by the time
+// anything looks -- so the name is turned away here instead.
+func validateName(name string) error {
+	if strings.HasSuffix(name, `\`) {
+		return fmt.Errorf("zip: file name %q ends in a backslash, which a reader reads as the separator that marks a directory entry: %w", name, ErrFormat)
+	}
+	return nil
+}
+
+// validateExtra reports whether extra is a well formed run of extra field
+// records -- a two byte id, a two byte length, and that many bytes -- which is
+// what the format says the area is and what a reader walks it as.
+//
+// A write path appends records of its own behind the caller's bytes: the
+// WinZip AES record that names the salt and the strength an entry was
+// encrypted under, the zip64 record that carries the real sizes of an entry
+// over four gigabytes, the timestamps. A reader stops at the first record
+// whose header or length does not fit, so a caller's stray byte hides
+// everything written behind it -- and the entry comes back marked encrypted
+// with nothing to describe how, its payload unrecoverable, with no error
+// reported on the way out.
+func validateExtra(extra []byte) error {
+	for i := 0; i < len(extra); {
+		if len(extra)-i < 4 {
+			return fmt.Errorf("zip: extra field ends %d bytes into the four an extra field record begins with: %w", len(extra)-i, ErrFormat)
+		}
+		id := binary.LittleEndian.Uint16(extra[i : i+2])
+		size := int(binary.LittleEndian.Uint16(extra[i+2 : i+4]))
+		if rest := len(extra) - i - 4; rest < size {
+			return fmt.Errorf("zip: extra field record %#04x declares %d bytes and %d are left: %w", id, size, rest, ErrFormat)
+		}
+		i += 4 + size
+	}
+	return nil
 }
 
 func (fh *FileHeader) injectAutoExtras() uint16 {

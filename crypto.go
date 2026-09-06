@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"hash"
 	"io"
 	"os"
@@ -27,9 +28,23 @@ type XCryptHeader struct {
 	MAC        []byte
 }
 
+const (
+	// xCryptIterations is how many rounds of key derivation this package's
+	// own archives are written with.
+	xCryptIterations = 600000
+
+	// maxXCryptIterations is the most an archive may ask for. The count
+	// comes out of the archive, and the derivation runs while the archive
+	// is being opened, before the password has been checked and with
+	// nothing to cancel it -- so a field four billion wide is a few hundred
+	// bytes that hold the caller for hours. The ceiling is well above what
+	// is written above and moves with it.
+	maxXCryptIterations = 4_000_000
+)
+
 func generateXCryptHeader(password string, iterations int) (*XCryptHeader, []byte, error) {
 	if iterations == 0 {
-		iterations = 600000
+		iterations = xCryptIterations
 	}
 
 	salt := make([]byte, 32)
@@ -65,12 +80,22 @@ func parseXCryptHeader(data []byte) (*XCryptHeader, error) {
 	if data[6] != 1 || data[7] != 1 || data[8] != 1 {
 		return nil, errors.New("zip: unsupported XCrypt algorithms")
 	}
+	// The count is checked here rather than where the key is derived, so
+	// that no work at all is done for an archive that names an impossible
+	// one. Zero is refused with it: a key derived in no rounds is the
+	// password put through one hash, which is not what this archive says it
+	// is protected by.
+	iterations := binary.LittleEndian.Uint32(data[9:13])
+	if iterations == 0 || iterations > maxXCryptIterations {
+		return nil, fmt.Errorf("zip: XCrypt header asks for %d rounds of key derivation, outside the 1 to %d this package accepts: %w",
+			iterations, maxXCryptIterations, ErrFormat)
+	}
 
 	hdr := &XCryptHeader{
 		Version:    data[6],
 		KdfAlgo:    data[7],
 		Cipher:     data[8],
-		Iterations: binary.LittleEndian.Uint32(data[9:13]),
+		Iterations: iterations,
 		Salt:       make([]byte, 32),
 		IV:         make([]byte, 16),
 		MAC:        make([]byte, 32),
@@ -162,7 +187,16 @@ func (cr *xCryptReaderAt) ReadAt(p []byte, off int64) (int, error) {
 	encBuf := make([]byte, readSize)
 
 	n, err := cr.r.ReadAt(encBuf, off-int64(rem))
-	if n == 0 && err != nil {
+	// The read starts at the cipher block boundary below the offset the
+	// caller asked for, so its first rem bytes belong to the block rather
+	// than to the caller and are dropped below. A read that came back with
+	// no more than those holds nothing of the caller's -- the stream ended
+	// inside the block their offset points into -- and dropping them anyway
+	// would slice past the end of the buffer.
+	if n <= rem {
+		if err == nil {
+			err = io.ErrUnexpectedEOF
+		}
 		return 0, err
 	}
 
@@ -229,7 +263,7 @@ func encapsulateXCryptZip(finalPath, tempPath, password string) (err error) {
 	w, _ := zw.CreateHeader(&FileHeader{Name: "README_ENCRYPTED.txt", Method: Store})
 	_, _ = w.Write(stubMsg)
 
-	cHdr, key, err := generateXCryptHeader(password, 600000)
+	cHdr, key, err := generateXCryptHeader(password, xCryptIterations)
 	if err != nil {
 		return err
 	}

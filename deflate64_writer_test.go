@@ -5,10 +5,13 @@ import (
 	"crypto/rand"
 	"errors"
 	"io"
+	mathrand "math/rand"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"testing"
+
+	"github.com/klauspost/compress/flate"
 )
 
 // cutoffWriter accepts limit bytes and fails every write past that, the way a
@@ -268,4 +271,252 @@ func TestDeflate64Writer_WriteReportsWriteError(t *testing.T) {
 	if err := encoder.Close(); !errors.Is(err, want) {
 		t.Fatalf("Close returned %v, want %v", err, want)
 	}
+}
+
+// deflate64RoundTrip compresses src and reads it back through this package's
+// own decoder, reporting what came out.
+func deflate64RoundTrip(t *testing.T, src []byte) ([]byte, error) {
+	t.Helper()
+	comp := new(bytes.Buffer)
+	enc := newDeflate64Writer(comp)
+	if _, err := enc.Write(src); err != nil {
+		t.Fatalf("compressing %d bytes: %v", len(src), err)
+	}
+	if err := enc.Close(); err != nil {
+		t.Fatalf("finishing the stream for %d bytes: %v", len(src), err)
+	}
+	dec := decodeDeflate64(bytes.NewReader(comp.Bytes()))
+	got, err := io.ReadAll(dec)
+	if cerr := dec.Close(); err == nil {
+		err = cerr
+	}
+	return got, err
+}
+
+// TestDeflate64Encoder_ShortInputsWithARepeatedPrefix: thirteen bytes were
+// enough to produce a stream nothing could read back. The header named the
+// code lengths correctly and the codes the entry was then written with were
+// generated from a different alphabet, so the decoder read a length symbol as
+// a literal and everything after it was another file.
+func TestDeflate64Encoder_ShortInputsWithARepeatedPrefix(t *testing.T) {
+	for _, src := range []string{
+		"0000100020000",
+		"0000100020001",
+		"aaaabaaacaaaa",
+		"xxxxyxxxzxxxx",
+		"000010002000",
+		"00001000200000",
+	} {
+		t.Run(src, func(t *testing.T) {
+			got, err := deflate64RoundTrip(t, []byte(src))
+			if err != nil {
+				t.Fatalf("what the encoder produced cannot be read back: %v", err)
+			}
+			if string(got) != src {
+				t.Errorf("read back %q, wrote %q", got, src)
+			}
+		})
+	}
+}
+
+// TestDeflate64Encoder_CorpusRoundTrips walks a corpus of the shapes that
+// decide how a block is coded -- runs, alternations, matches that reach the
+// end of a block, random bytes -- because the defect above showed itself on
+// one input in a handful and not on the one beside it.
+func TestDeflate64Encoder_CorpusRoundTrips(t *testing.T) {
+	// #nosec G404 -- a fixed seed is the point: the corpus has to be the same corpus on every run
+	rng := mathrand.New(mathrand.NewSource(20240907))
+
+	corpus := make([][]byte, 0, 4200)
+	// Every input up to six bytes over a two letter alphabet: the smallest
+	// inputs that can carry a match at all, exhaustively.
+	for n := 1; n <= 6; n++ {
+		for v := 0; v < 1<<n; v++ {
+			word := make([]byte, n)
+			for i := range word {
+				word[i] = byte('a' + (v>>i)&1)
+			}
+			corpus = append(corpus, word)
+		}
+	}
+	// Structured inputs: a repeated prefix broken by single bytes, at every
+	// length and every break point, which is the shape that failed.
+	for n := 8; n <= 40; n++ {
+		for b := 1; b < n; b++ {
+			word := bytes.Repeat([]byte("0"), n)
+			word[b] = '1'
+			if b+4 < n {
+				word[b+4] = '2'
+			}
+			corpus = append(corpus, word)
+		}
+	}
+	// Random bytes over alphabets of a few sizes, so that the frequency
+	// tables come out with very different numbers of live symbols.
+	for _, alphabet := range []int{2, 3, 5, 17, 256} {
+		for i := 0; i < 400; i++ {
+			word := make([]byte, 1+rng.Intn(300))
+			for j := range word {
+				// #nosec G115 -- the largest alphabet here is 256, so the value is a byte by construction
+				word[j] = byte(rng.Intn(alphabet))
+			}
+			corpus = append(corpus, word)
+		}
+	}
+
+	for _, src := range corpus {
+		got, err := deflate64RoundTrip(t, src)
+		if err != nil {
+			t.Fatalf("what the encoder produced for %q cannot be read back: %v", src, err)
+		}
+		if !bytes.Equal(got, src) {
+			t.Fatalf("read back %q, wrote %q", got, src)
+		}
+	}
+	t.Logf("%d inputs round tripped", len(corpus))
+}
+
+// TestDeflate64Encoder_PlainDeflateStreamsAreReadableByFlate: what the encoder
+// writes for an input that needs none of the Deflate64 extensions is an
+// ordinary deflate stream, so the standard library's decoder has to read it
+// too. It is the second opinion on the encoder: a stream only one decoder
+// accepts is a stream the encoder and that decoder agree to be wrong about.
+func TestDeflate64Encoder_PlainDeflateStreamsAreReadableByFlate(t *testing.T) {
+	// #nosec G404 -- as above: the corpus is the same on every run by design
+	rng := mathrand.New(mathrand.NewSource(20240908))
+
+	corpus := [][]byte{
+		[]byte("0000100020000"),
+		[]byte("0000100020001"),
+		[]byte("aaaabaaacaaaa"),
+		[]byte("xxxxyxxxzxxxx"),
+	}
+	for i := 0; i < 600; i++ {
+		// Held under the 258 byte maximum match of plain deflate and
+		// well inside its 32 KiB window, so nothing here can need a
+		// Deflate64 length or distance code.
+		word := make([]byte, 1+rng.Intn(200))
+		for j := range word {
+			// #nosec G115 -- four letters starting at 'a' is a byte by construction
+			word[j] = byte('a' + rng.Intn(4))
+		}
+		corpus = append(corpus, word)
+	}
+
+	for _, src := range corpus {
+		comp := new(bytes.Buffer)
+		enc := newDeflate64Writer(comp)
+		if _, err := enc.Write(src); err != nil {
+			t.Fatalf("compressing %q: %v", src, err)
+		}
+		if err := enc.Close(); err != nil {
+			t.Fatalf("finishing the stream for %q: %v", src, err)
+		}
+
+		fr := flate.NewReader(bytes.NewReader(comp.Bytes()))
+		got, err := io.ReadAll(fr)
+		if cerr := fr.Close(); err == nil {
+			err = cerr
+		}
+		if err != nil {
+			t.Fatalf("the standard library's decoder refuses what the encoder wrote for %q: %v", src, err)
+		}
+		if !bytes.Equal(got, src) {
+			t.Fatalf("the standard library's decoder read back %q, want %q", got, src)
+		}
+	}
+}
+
+// TestDeflate64_LengthTablesAreNotAliased: the Deflate64 length tables are
+// built from the Deflate ones, and building them by appending to a slice of an
+// array wrote into the array behind it. Code 285 is where the two differ, and
+// it is exactly the slot that was overwritten: the Deflate table lost its 258
+// byte maximum match and its zero extra bits.
+func TestDeflate64_LengthTablesAreNotAliased(t *testing.T) {
+	if got := lengthBase32[28]; got != 258 {
+		t.Errorf("the Deflate length base for code 285 is %d, want 258", got)
+	}
+	if got := lengthExtraBits32[28]; got != 0 {
+		t.Errorf("the Deflate length code 285 carries %d extra bits, want 0", got)
+	}
+	if got := lengthBase64[28]; got != 3 {
+		t.Errorf("the Deflate64 length base for code 285 is %d, want 3", got)
+	}
+	if got := lengthExtraBits64[28]; got != 16 {
+		t.Errorf("the Deflate64 length code 285 carries %d extra bits, want 16", got)
+	}
+}
+
+// TestDeflate64_EntryRoundTripsThroughAnArchive is the same defect where a
+// caller meets it: an entry written with Method Deflate64. Plain, the checksum
+// caught the corruption and the entry failed to read; under WinZip AES it did
+// not, because AE-2 stores a zero checksum and the authentication code is over
+// the ciphertext rather than the plaintext -- so thirteen bytes went in, other
+// bytes came out, and both the read and the close reported success.
+func TestDeflate64_EntryRoundTripsThroughAnArchive(t *testing.T) {
+	body := []byte("0000100020000")
+
+	t.Run("plain", func(t *testing.T) {
+		buf := new(bytes.Buffer)
+		zw := NewWriter(buf)
+		mustWrite(t, mustCreateHeader(t, zw, &FileHeader{Name: "a.bin", Method: Deflate64}), body)
+		if err := zw.Close(); err != nil {
+			t.Fatalf("closing the writer: %v", err)
+		}
+
+		zr, err := NewReader(bytes.NewReader(buf.Bytes()), int64(buf.Len()))
+		if err != nil {
+			t.Fatalf("reading the archive back: %v", err)
+		}
+		rc, err := zr.File[0].Open()
+		if err != nil {
+			t.Fatalf("opening the entry: %v", err)
+		}
+		closeAt(t, rc)
+		got, err := io.ReadAll(rc)
+		if err != nil {
+			t.Fatalf("reading the entry: %v", err)
+		}
+		if err := rc.Close(); err != nil {
+			t.Fatalf("closing the entry: %v", err)
+		}
+		if !bytes.Equal(got, body) {
+			t.Errorf("the entry holds %q, want %q", got, body)
+		}
+	})
+
+	t.Run("under WinZip AES", func(t *testing.T) {
+		const password = "pw"
+		buf := new(bytes.Buffer)
+		zw := NewWriter(buf)
+		mustWrite(t, mustCreateHeader(t, zw, &FileHeader{
+			Name:        "a.bin",
+			Method:      Deflate64,
+			Password:    password,
+			AESStrength: 3,
+		}), body)
+		if err := zw.Close(); err != nil {
+			t.Fatalf("closing the writer: %v", err)
+		}
+
+		zr, err := NewReaderWithPassword(bytes.NewReader(buf.Bytes()), int64(buf.Len()), password)
+		if err != nil {
+			t.Fatalf("reading the archive back: %v", err)
+		}
+		rc, err := zr.File[0].Open()
+		if err != nil {
+			t.Fatalf("opening the entry: %v", err)
+		}
+		closeAt(t, rc)
+		got, err := io.ReadAll(rc)
+		if err != nil {
+			t.Fatalf("reading the entry: %v", err)
+		}
+		if err := rc.Close(); err != nil {
+			t.Fatalf("closing the entry: %v", err)
+		}
+		if !bytes.Equal(got, body) {
+			t.Errorf("the entry holds %q, want %q -- and nothing reported the difference", got, body)
+		}
+	})
 }

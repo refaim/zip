@@ -4,6 +4,7 @@
 package zip
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"os/user"
@@ -501,5 +502,109 @@ func TestSysPlatformExtraDevice(t *testing.T) {
 	sysPlatformExtra(fi, &hdr)
 	if hdr.Devmajor == 0 && hdr.Devminor == 0 {
 		t.Errorf("no device number came back for /dev/null: %d:%d", hdr.Devmajor, hdr.Devminor)
+	}
+}
+
+// TestExtractor_DirectoryStaysTraversable: a directory has to be enterable by
+// whoever may read it, or the files the extraction wrote inside it cannot be
+// opened, listed or removed. The mode an entry carries comes from its MS-DOS
+// attributes when it has no Unix mode of its own, and those have no search bit
+// at all -- so an archive this package's own writer produced extracted into
+// directories nothing could go into, and reported success over them.
+func TestExtractor_DirectoryStaysTraversable(t *testing.T) {
+	body := []byte("this file has to be reachable afterwards")
+
+	var buf bytes.Buffer
+	zw := NewWriter(&buf)
+	// No SetMode on either: the entries carry the attributes a writer puts
+	// on a name, and nothing else.
+	mustCreateHeader(t, zw, &FileHeader{Name: "dir/", Method: Store})
+	mustWrite(t, mustCreateHeader(t, zw, &FileHeader{Name: "dir/inside.txt", Method: Store}), body)
+	if err := zw.Close(); err != nil {
+		t.Fatalf("closing the writer: %v", err)
+	}
+
+	root := t.TempDir()
+	e, err := NewExtractorFromReader(bytes.NewReader(buf.Bytes()), int64(buf.Len()), root,
+		WithExtractorConcurrency(1), WithExtractorNoTimes(true))
+	if err != nil {
+		t.Fatalf("building the extractor: %v", err)
+	}
+	closeAt(t, e)
+	if err := e.Extract(context.Background()); err != nil {
+		t.Fatalf("extracting: %v", err)
+	}
+
+	dir := filepath.Join(root, "dir")
+	// Whatever the assertions below decide, the framework has to be able to
+	// take the directory away again.
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+
+	info, err := os.Lstat(dir)
+	if err != nil {
+		t.Fatalf("stat the extracted directory: %v", err)
+	}
+	if perm := info.Mode().Perm(); perm&0o100 == 0 {
+		t.Errorf("the extracted directory is %v, which the owner cannot enter", info.Mode())
+	}
+	got, err := os.ReadFile(filepath.Join(dir, "inside.txt"))
+	if err != nil {
+		t.Fatalf("the file the extraction counted cannot be read back: %v", err)
+	}
+	if !bytes.Equal(got, body) {
+		t.Errorf("inside.txt holds %d bytes, want the %d written", len(got), len(body))
+	}
+}
+
+// TestExtractor_DirectoryModeKeepsWhatItWasGiven: the search bit is added
+// beside a read bit and nowhere else, so a directory an archive deliberately
+// closed to a group or to the world stays closed to them.
+func TestExtractor_DirectoryModeKeepsWhatItWasGiven(t *testing.T) {
+	for _, tc := range []struct {
+		stored os.FileMode
+		want   os.FileMode
+	}{
+		{0o700, 0o700},
+		{0o755, 0o755},
+		{0o644, 0o755},
+		{0o600, 0o700},
+		{0o640, 0o750},
+		{0o604, 0o705},
+		{0o000, 0o000},
+	} {
+		t.Run(tc.stored.String(), func(t *testing.T) {
+			var buf bytes.Buffer
+			zw := NewWriter(&buf)
+			fh := &FileHeader{Name: "dir/", Method: Store}
+			fh.SetMode(os.ModeDir | tc.stored)
+			mustCreateHeader(t, zw, fh)
+			if err := zw.Close(); err != nil {
+				t.Fatalf("closing the writer: %v", err)
+			}
+
+			root := t.TempDir()
+			e, err := NewExtractorFromReader(bytes.NewReader(buf.Bytes()), int64(buf.Len()), root,
+				WithExtractorConcurrency(1), WithExtractorNoTimes(true))
+			if err != nil {
+				t.Fatalf("building the extractor: %v", err)
+			}
+			closeAt(t, e)
+			if err := e.Extract(context.Background()); err != nil {
+				t.Fatalf("extracting: %v", err)
+			}
+
+			dir := filepath.Join(root, "dir")
+			t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+			info, err := os.Lstat(dir)
+			if err != nil {
+				t.Fatalf("stat the extracted directory: %v", err)
+			}
+			// The umask takes bits away from what Mkdir asks for and
+			// never from a chmod, so what is on disk is what was
+			// applied.
+			if got := info.Mode().Perm(); got != tc.want {
+				t.Errorf("a directory stored as %v came out %v, want %v", tc.stored, got, tc.want)
+			}
+		})
 	}
 }
