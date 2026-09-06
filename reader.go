@@ -606,13 +606,29 @@ func (f *File) findHiddenIndex() (int, []byte, error) {
 // OpenSeekable returns a ReadSeeker for the file content.
 // It requires a Seek Index (Hidden SOZip or GZIDX) to be present in the archive for compressed files.
 //
-// For an AES-encrypted entry the bytes this returns are decrypted but not
-// authenticated: reading at an offset cannot check an authentication code
-// computed over the whole entry, so the AE-2 code that Open verifies is not
-// verified here, and AE-2 leaves the CRC zero as well. AES-CTR is malleable,
-// so a flipped bit in the archive is a flipped bit in what this hands back,
-// and nothing reports it. Use Open where the data has to be trusted.
+// For an AES-encrypted entry the authentication code the format stores over
+// the whole entry is checked before any of that entry's data is handed back,
+// since AE-2 leaves the CRC zero and AES-CTR is malleable, so nothing else
+// would notice a flipped bit. The check is one sequential pass over the
+// ciphertext, run once per open rather than once per read: for a stored entry
+// it runs here, and for an entry read through a seek index when its decrypter
+// is built on the first read. A mismatch is the same ErrChecksum-bearing error
+// Open gives. OpenSeekableUnverified skips the pass.
 func (f *File) OpenSeekable() (io.ReadSeeker, error) {
+	return f.openSeekable(true)
+}
+
+// OpenSeekableUnverified is OpenSeekable without the authentication pass over
+// an AES-encrypted entry. It saves one sequential read of the entry and gives
+// up what that read buys: a tampered entry reads back as whatever the change
+// made of it, with no ErrChecksum and nothing else to report it. Use it only
+// where the entry is large enough for the pass to matter and the archive is
+// trusted on other grounds.
+func (f *File) OpenSeekableUnverified() (io.ReadSeeker, error) {
+	return f.openSeekable(false)
+}
+
+func (f *File) openSeekable(verify bool) (io.ReadSeeker, error) {
 	actualMethod := f.Method
 	if f.Method == winzipAesExtraID && f.aesInfo != nil {
 		actualMethod = f.aesInfo.actualMethod
@@ -631,7 +647,7 @@ func (f *File) OpenSeekable() (io.ReadSeeker, error) {
 				// #nosec G115 -- readDirectoryHeader and salvage both refuse an entry whose CompressedSize64 is above MaxInt64
 				rawSection := io.NewSectionReader(f.zipr, f.headerOffset+bodyOffset, int64(f.CompressedSize64))
 				// #nosec G115 -- readDirectoryHeader and salvage both refuse an entry whose CompressedSize64 is above MaxInt64
-				aesRA, err := newWinZipAesReaderAt(rawSection, f.zip.password(), f.aesInfo, int64(f.CompressedSize64))
+				aesRA, err := newWinZipAesReaderAt(rawSection, f.zip.password(), f.aesInfo, int64(f.CompressedSize64), verify)
 				if err != nil {
 					return nil, err
 				}
@@ -687,7 +703,7 @@ func (f *File) OpenSeekable() (io.ReadSeeker, error) {
 		f.SeekChunkSize = chunkSize
 		f.SeekIndex = index
 
-		return &solidReadSeeker{f: f}, nil
+		return &solidReadSeeker{f: f, verify: verify}, nil
 	}
 
 	// findHiddenIndex answers with 0, 1 or 2, and the first two are handled
@@ -739,7 +755,7 @@ func (f *File) OpenSeekable() (io.ReadSeeker, error) {
 
 	f.SeekChunkSize = chunkSize
 	f.GzidxPoints = points
-	return &solidReadSeeker{f: f, isContinuous: true}, nil
+	return &solidReadSeeker{f: f, isContinuous: true, verify: verify}, nil
 }
 
 type solidReadSeeker struct {
@@ -747,6 +763,15 @@ type solidReadSeeker struct {
 	off          int64
 	currRC       io.ReadCloser
 	isContinuous bool
+	// verify says whether the entry's AES authentication code is checked
+	// when the decrypter below is built.
+	verify bool
+	// aesRA is the decrypter over the whole entry. A seek drops the
+	// decompressor in front of it, and rebuilding this with it would derive
+	// the key and go over the entry again on every seek, so it is built on
+	// the first read and kept. It holds the password the first read saw,
+	// the way the stored path holds the one its open saw.
+	aesRA *winZipAesReaderAt
 }
 
 func (s *solidReadSeeker) Seek(offset int64, whence int) (int64, error) {
@@ -828,18 +853,19 @@ func (s *solidReadSeeker) Read(p []byte) (int, error) {
 			if s.f.zip.password == nil {
 				return 0, errors.New("zip: file is encrypted but no password provided")
 			}
-			pass := s.f.zip.password()
-
 			if s.f.Method == winzipAesExtraID || s.f.aesInfo != nil {
-				rawSection := io.NewSectionReader(s.f.zipr, s.f.headerOffset+bodyOffset, totalCompSize)
-				aesRA, err := newWinZipAesReaderAt(rawSection, pass, s.f.aesInfo, totalCompSize)
-				if err != nil {
-					return 0, err
+				if s.aesRA == nil {
+					rawSection := io.NewSectionReader(s.f.zipr, s.f.headerOffset+bodyOffset, totalCompSize)
+					aesRA, err := newWinZipAesReaderAt(rawSection, s.f.zip.password(), s.f.aesInfo, totalCompSize, s.verify)
+					if err != nil {
+						return 0, err
+					}
+					s.aesRA = aesRA
 				}
 				actualMethod = s.f.aesInfo.actualMethod
 
-				remainingComp := aesRA.limit - compOffset
-				section = io.NewSectionReader(aesRA, compOffset, remainingComp)
+				remainingComp := s.aesRA.limit - compOffset
+				section = io.NewSectionReader(s.aesRA, compOffset, remainingComp)
 			} else {
 				return 0, errors.New("zip: random access not supported for classic ZipCrypto")
 			}

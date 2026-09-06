@@ -391,17 +391,21 @@ func TestXCrypt_RoundTrip(t *testing.T) {
 	})
 
 	t.Run("a wrong password is refused", func(t *testing.T) {
-		// The wrong key decrypts to bytes that are not an archive. What
-		// matters is that this is reported: handing back a reader over
-		// them would make a wrong password look like a corrupt archive
-		// to everything upstream.
+		// The wrong key computes an authentication code the header does
+		// not carry, which is what the archive is refused on. Handing
+		// back a reader over the bytes the wrong key produced would make
+		// a wrong password look like a corrupt archive to everything
+		// upstream.
 		zr, err := OpenReaderWithPassword(final, "hunter2")
 		if err == nil {
 			closeAt(t, zr)
 			t.Fatalf("a wrong password opened the archive with %d entries", len(zr.File))
 		}
-		if !errors.Is(err, ErrFormat) {
-			t.Errorf("a wrong password reported %v, want %v", err, ErrFormat)
+		if !errors.Is(err, ErrPassword) || !errors.Is(err, ErrChecksum) {
+			t.Errorf("a wrong password reported %v, want the authentication code refused", err)
+		}
+		if errors.Is(err, ErrFormat) {
+			t.Errorf("a wrong password reported %v, which reads as a broken archive", err)
 		}
 	})
 }

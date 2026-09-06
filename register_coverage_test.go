@@ -510,14 +510,14 @@ func TestRegisterCovAesReaderRejects(t *testing.T) {
 		if _, _, err := newWinZipAesReader(bytes.NewReader(nil), password, nil, 0); err == nil {
 			t.Error("a stream reader was built without the AES parameters")
 		}
-		if _, err := newWinZipAesReaderAt(bytes.NewReader(nil), password, nil, 0); err == nil {
+		if _, err := newWinZipAesReaderAt(bytes.NewReader(nil), password, nil, 0, true); err == nil {
 			t.Error("a seekable reader was built without the AES parameters")
 		}
 	})
 
 	t.Run("a body that stops inside the salt", func(t *testing.T) {
 		body := []byte{1, 2, 3}
-		if _, err := newWinZipAesReaderAt(bytes.NewReader(body), password, RegisterCovAesInfo(3), 64); err == nil {
+		if _, err := newWinZipAesReaderAt(bytes.NewReader(body), password, RegisterCovAesInfo(3), 64, true); err == nil {
 			t.Error("a seekable reader was built on a body with no room for the salt")
 		}
 	})
@@ -527,14 +527,14 @@ func TestRegisterCovAesReaderRejects(t *testing.T) {
 		if _, _, err := newWinZipAesReader(bytes.NewReader(body), password, RegisterCovAesInfo(1), int64(len(body))); err == nil {
 			t.Error("a stream reader was built without a verification value to check")
 		}
-		if _, err := newWinZipAesReaderAt(bytes.NewReader(body), password, RegisterCovAesInfo(1), int64(len(body))); err == nil {
+		if _, err := newWinZipAesReaderAt(bytes.NewReader(body), password, RegisterCovAesInfo(1), int64(len(body)), true); err == nil {
 			t.Error("a seekable reader was built without a verification value to check")
 		}
 	})
 
 	t.Run("the wrong password", func(t *testing.T) {
 		body := RegisterCovAesBody(t, password, 3, plain, 10)
-		_, err := newWinZipAesReaderAt(bytes.NewReader(body), "not the password", RegisterCovAesInfo(3), int64(len(body)))
+		_, err := newWinZipAesReaderAt(bytes.NewReader(body), "not the password", RegisterCovAesInfo(3), int64(len(body)), true)
 		if !errors.Is(err, ErrPassword) {
 			t.Errorf("got error %v, want a password mismatch", err)
 		}
@@ -545,7 +545,7 @@ func TestRegisterCovAesReaderRejects(t *testing.T) {
 		if _, _, err := newWinZipAesReader(bytes.NewReader(body), password, RegisterCovAesInfo(1), int64(len(body))); err == nil {
 			t.Error("a stream reader was built on a body too short to hold a code")
 		}
-		if _, err := newWinZipAesReaderAt(bytes.NewReader(body), password, RegisterCovAesInfo(1), int64(len(body))); err == nil {
+		if _, err := newWinZipAesReaderAt(bytes.NewReader(body), password, RegisterCovAesInfo(1), int64(len(body)), true); err == nil {
 			t.Error("a seekable reader was built on a body too short to hold a code")
 		}
 	})
@@ -591,7 +591,11 @@ func TestRegisterCovAesReaderAtStrengths(t *testing.T) {
 			// recorded size counts the authentication code as well, so the
 			// underlying source ends exactly where the data does.
 			body := RegisterCovAesBody(t, password, strength, plain, 0)
-			ar, err := newWinZipAesReaderAt(RegisterCovEOFReaderAt{data: body}, password, RegisterCovAesInfo(strength), int64(len(body)+10))
+			// The fixture carries no authentication code to check, and
+			// what is under test here is the decryption at an offset:
+			// the reader is built the way OpenSeekableUnverified builds
+			// it.
+			ar, err := newWinZipAesReaderAt(RegisterCovEOFReaderAt{data: body}, password, RegisterCovAesInfo(strength), int64(len(body)+10), false)
 			if err != nil {
 				t.Fatalf("build the reader: %v", err)
 			}
