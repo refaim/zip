@@ -10,8 +10,6 @@ import (
 	"strings"
 )
 
-const bufferSize int64 = 1 << 20 // 1M
-
 // AppendMode specifies the way to append new file to existing zip archive.
 type AppendMode int
 
@@ -38,12 +36,19 @@ func newSectionReaderWriter(rws io.ReadWriteSeeker) *sectionReaderWriter {
 	}
 }
 
-func (s *sectionReaderWriter) ReadAt(p []byte, offset int64) (int, error) {
+func (s *sectionReaderWriter) ReadAt(p []byte, offset int64) (n int, err error) {
 	currOffset, err := s.rws.Seek(0, io.SeekCurrent)
 	if err != nil {
 		return 0, err
 	}
-	defer s.rws.Seek(currOffset, io.SeekStart)
+	defer func() {
+		// The updater keeps writing at wherever the handle was left,
+		// so a restore that did not happen sends the next write to the
+		// offset this call read from instead.
+		if _, serr := s.rws.Seek(currOffset, io.SeekStart); serr != nil && err == nil {
+			err = serr
+		}
+	}()
 	_, err = s.rws.Seek(offset, io.SeekStart)
 	if err != nil {
 		return 0, err
@@ -56,7 +61,13 @@ func (s *sectionReaderWriter) WriteAt(p []byte, offset int64) (n int, err error)
 	if err != nil {
 		return 0, err
 	}
-	defer s.rws.Seek(currOffset, io.SeekStart)
+	defer func() {
+		// As in ReadAt: everything after this call writes at the
+		// position the handle is left at.
+		if _, serr := s.rws.Seek(currOffset, io.SeekStart); serr != nil && err == nil {
+			err = serr
+		}
+	}()
 	_, err = s.rws.Seek(offset, io.SeekStart)
 	if err != nil {
 		return 0, err
@@ -124,6 +135,12 @@ func NewUpdater(rws io.ReadWriteSeeker) (*Updater, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Everything below measures against this: the offsets the central
+	// directory gives are checked against it, and a buffer for the end
+	// record is made from it.
+	if size < 0 {
+		return nil, errors.New("zip: size cannot be negative")
+	}
 	zu := &Updater{
 		rw:  newSectionReaderWriter(rws),
 		rws: rws,
@@ -157,7 +174,9 @@ func (u *Updater) init(size int64) error {
 		return errors.New("zip: updating archives with encrypted central directory is not supported")
 	}
 	u.baseOffset = baseOffset
+	// #nosec G115 -- readDirectoryEnd rejects a directory offset above MaxInt64 and checks that baseOffset plus this one lands inside the archive
 	u.dirOffset = int64(end.directoryOffset) + baseOffset
+	// #nosec G115 -- NewUpdater refuses a negative size, so this is the length of the archive
 	if end.directorySize < uint64(size) && (uint64(size)-end.directorySize)/30 >= end.directoryRecords {
 		u.dir = make([]*header, 0, end.directoryRecords)
 	}
@@ -176,12 +195,28 @@ func (u *Updater) init(size int64) error {
 			return err
 		}
 		f.headerOffset += u.baseOffset
+		// RemoveFile shifts the bytes between two entries down and
+		// writes them at the offset the central directory gave for the
+		// first of them, and AppendHeader overwrites an entry in place
+		// at that same offset. An entry that claims to start after the
+		// central directory, or before the archive, would send those
+		// writes somewhere in the middle of the file the user handed
+		// over -- so the offsets are checked once here rather than at
+		// each of the writes.
+		if f.headerOffset < 0 || f.headerOffset > u.dirOffset {
+			return fmt.Errorf("zip: entry %q has its local header at %d, outside the %d bytes before the central directory: %w",
+				f.Name, f.headerOffset, u.dirOffset, ErrFormat)
+		}
 		h := &header{
 			FileHeader: &f.FileHeader,
-			offset:     uint64(f.headerOffset),
+			// #nosec G115 -- the check above holds headerOffset to 0 <= offset <= dirOffset
+			offset: uint64(f.headerOffset),
 		}
 		u.dir = append(u.dir, h)
 	}
+	// The end record counts its entries in two bytes, so only the low
+	// sixteen bits of what was read can be compared with it.
+	// #nosec G115 -- see above: both sides are deliberately taken modulo 2^16
 	if uint16(len(u.dir)) != uint16(end.directoryRecords) {
 		return err
 	}
@@ -235,10 +270,11 @@ func (u *Updater) AppendHeader(fh *FileHeader, mode AppendMode) (io.Writer, erro
 
 	var err error
 	var offset int64 = -1
-	var existingDirIndex int = -1
+	var existingDirIndex = -1
 	if mode == APPEND_MODE_OVERWRITE {
 		for i, d := range u.dir {
 			if d.Name == fh.Name {
+				// #nosec G115 -- init holds every entry offset to 0 <= offset <= dirOffset
 				offset = int64(d.offset)
 				existingDirIndex = i
 				break
@@ -280,7 +316,8 @@ func (u *Updater) AppendHeader(fh *FileHeader, mode AppendMode) (io.Writer, erro
 	)
 	h := &header{
 		FileHeader: fh,
-		offset:     uint64(u.offset),
+		// #nosec G115 -- u.offset is either an entry offset init checked or dirOffset, both of which are inside the archive
+		offset: uint64(u.offset),
 	}
 	if strings.HasSuffix(fh.Name, "/") {
 		fh.Method = Store
@@ -350,19 +387,21 @@ func (u *Updater) AppendHeader(fh *FileHeader, mode AppendMode) (io.Writer, erro
 }
 
 func (u *Updater) RemoveFile(dirIndex int) (int64, error) {
+	// #nosec G115 -- init holds every entry offset to 0 <= offset <= dirOffset
 	var start = int64(u.dir[dirIndex].offset)
 	var end int64
 	if dirIndex == len(u.dir)-1 {
 		end = u.dirOffset
 	} else {
+		// #nosec G115 -- init holds every entry offset to 0 <= offset <= dirOffset
 		end = int64(u.dir[dirIndex+1].offset)
 	}
 	var size = end - start
 
 	const chunkBufSize = 2 * 1024 * 1024 // 2MB для быстрого сдвига
 	var buffer = make([]byte, chunkBufSize)
-	var rp int64 = end
-	var wp int64 = start
+	var rp = end
+	var wp = start
 	for rp < u.dirOffset-chunkBufSize {
 		n, err := u.rw.ReadAt(buffer, rp)
 		if err != nil {
@@ -392,6 +431,7 @@ func (u *Updater) RemoveFile(dirIndex int) (int64, error) {
 	}
 	u.dir = append(u.dir[:dirIndex], u.dir[dirIndex+1:len(u.dir)]...)
 	for i := dirIndex; i < len(u.dir); i++ {
+		// #nosec G115 -- u.dir is sorted by offset and every offset is at most dirOffset, so end is never before start
 		u.dir[i].offset -= uint64(size)
 	}
 	return wp, nil
@@ -442,11 +482,11 @@ func (u *Updater) Close() error {
 	}
 	u.closed = true
 
-	// Central directory must start immediately after the last file
+	// The central directory starts where the data ends. dirOffset is
+	// already that place whichever way the last entry was finished:
+	// prepare moves it past an entry when the next one starts, and the
+	// block below moves it past the last one when the updater is closed.
 	start := u.dirOffset
-	if u.last != nil {
-		// If we wrote something, the actual end of data is in u.dirOffset
-	}
 
 	if _, err := u.rw.Seek(start, io.SeekStart); err != nil {
 		return err
@@ -467,7 +507,7 @@ func (u *Updater) Close() error {
 
 func (u *Updater) writeDirectory(start int64) error {
 	for _, h := range u.dir {
-		var buf []byte = make([]byte, directoryHeaderLen)
+		var buf = make([]byte, directoryHeaderLen)
 		b := writeBuf(buf)
 		b.uint32(uint32(directoryHeaderSignature))
 		b.uint16(h.CreatorVersion)
@@ -494,9 +534,21 @@ func (u *Updater) writeDirectory(start int64) error {
 			b.uint32(h.UncompressedSize)
 		}
 
-		b.uint16(uint16(len(h.Name)))
-		b.uint16(uint16(len(h.Extra)))
-		b.uint16(uint16(len(h.Comment)))
+		nameLen, err := fitUint16(len(h.Name), "file name")
+		if err != nil {
+			return err
+		}
+		extraLen, err := fitUint16(len(h.Extra), "extra field")
+		if err != nil {
+			return err
+		}
+		commentLen, err := fitUint16(len(h.Comment), "file comment")
+		if err != nil {
+			return err
+		}
+		b.uint16(nameLen)
+		b.uint16(extraLen)
+		b.uint16(commentLen)
 		b = b[4:]
 		b.uint32(h.ExternalAttrs)
 		if h.offset > uint32max {
@@ -523,7 +575,9 @@ func (u *Updater) writeDirectory(start int64) error {
 	}
 
 	records := uint64(len(u.dir))
+	// #nosec G115 -- end is where writing the directory left off and start is where it began, so the difference is not negative
 	size := uint64(end - start)
+	// #nosec G115 -- start is dirOffset, which init holds inside the archive
 	offset := uint64(start)
 
 	if records >= uint16max || size >= uint32max || offset >= uint32max {
@@ -543,6 +597,7 @@ func (u *Updater) writeDirectory(start int64) error {
 
 		b.uint32(directory64LocSignature)
 		b.uint32(0)
+		// #nosec G115 -- end is the offset writing the directory reached and is not negative
 		b.uint64(uint64(end))
 		b.uint32(1)
 
@@ -563,6 +618,7 @@ func (u *Updater) writeDirectory(start int64) error {
 	b.uint16(uint16(records))
 	b.uint32(uint32(size))
 	b.uint32(uint32(offset))
+	// #nosec G115 -- SetComment refuses a comment over uint16max, and one read from an archive came out of a two-byte length
 	b.uint16(uint16(len(u.comment)))
 	if _, err := u.rw.Write(buf[:]); err != nil {
 		return err

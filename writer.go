@@ -18,11 +18,6 @@ import (
 	"unicode/utf8"
 )
 
-var (
-	errLongName  = errors.New("zip: FileHeader.Name too long")
-	errLongExtra = errors.New("zip: FileHeader.Extra too long")
-)
-
 type Writer struct {
 	cw          *countWriter
 	dir         []*header
@@ -121,20 +116,33 @@ func (c *chunkSeekWriter) Write(p []byte) (n int, err error) {
 		}
 
 		n += wn
+		// #nosec G115 -- wn is at most toWrite, which is what is left of the chunk and so below chunkSize
 		c.written += uint32(wn)
 		c.totalWrite += int64(wn)
 		p = p[wn:]
 
 		if c.written >= c.chunkSize {
 			// Only flush and record if we are NOT at the very end of the file.
+			// #nosec G115 -- the size is the caller's own declaration for the entry being written, not a number read from an archive
 			if c.h.UncompressedSize64 == 0 || c.totalWrite < int64(c.h.UncompressedSize64) {
 				if !c.continuous && (c.origMethod == ZSTD) {
-					c.fw.comp.Close()
-					newComp, _ := c.compFac(c.sink)
+					// Closing the compressor is what puts the
+					// tail of the chunk into the stream; the
+					// index entry recorded just below says the
+					// next chunk starts after it.
+					if cerr := c.fw.comp.Close(); cerr != nil {
+						return n, cerr
+					}
+					newComp, cerr := c.compFac(c.sink)
+					if cerr != nil {
+						return n, cerr
+					}
 					c.fw.comp = newComp
 				} else {
 					if f, ok := c.fw.comp.(flusher); ok {
-						f.Flush()
+						if ferr := f.Flush(); ferr != nil {
+							return n, ferr
+						}
 					}
 				}
 
@@ -143,6 +151,7 @@ func (c *chunkSeekWriter) Write(p []byte) (n int, err error) {
 
 				if c.continuous {
 					pt := gzPoint{
+						// #nosec G115 -- both counters are byte counts this writer keeps and neither goes below zero
 						compOffset:   uint64(relativeOffset),
 						uncompOffset: uint64(c.totalWrite),
 						bits:         0,
@@ -156,6 +165,7 @@ func (c *chunkSeekWriter) Write(p []byte) (n int, err error) {
 					if r, ok := c.fw.comp.(interface{ ResetDict() }); ok {
 						r.ResetDict()
 					}
+					// #nosec G115 -- relativeOffset is how far into the entry's own data the writer has got and does not go below zero
 					c.h.SeekIndex = append(c.h.SeekIndex, uint64(relativeOffset))
 				}
 			}
@@ -229,9 +239,21 @@ func (w *Writer) Close() error {
 			b.uint32(h.UncompressedSize)
 		}
 
-		b.uint16(uint16(len(h.Name)))
-		b.uint16(uint16(len(h.Extra)))
-		b.uint16(uint16(len(h.Comment)))
+		nameLen, err := fitUint16(len(h.Name), "file name")
+		if err != nil {
+			return err
+		}
+		extraLen, err := fitUint16(len(h.Extra), "extra field")
+		if err != nil {
+			return err
+		}
+		commentLen, err := fitUint16(len(h.Comment), "file comment")
+		if err != nil {
+			return err
+		}
+		b.uint16(nameLen)
+		b.uint16(extraLen)
+		b.uint16(commentLen)
 		b = b[4:]
 		b.uint32(h.ExternalAttrs)
 		if h.offset > uint32max {
@@ -259,16 +281,26 @@ func (w *Writer) Close() error {
 
 	// Интегрируем генерацию скрытого файла избыточности .recovery.par2 прямо перед CD
 	if w.recoveryPct > 0 && w.recoveryFile != nil && !w.torrentZip && w.password == "" {
-		w.cw.w.(*bufio.Writer).Flush()
+		// The recovery data is computed from the archive as it is on
+		// disk, so everything written so far has to be there first: a
+		// dropped flush produced recovery data for an earlier version
+		// of the archive than the one it was stored next to.
+		if ferr := w.cw.w.(*bufio.Writer).Flush(); ferr != nil {
+			return ferr
+		}
 		if syncer, ok := interface{}(w.recoveryFile).(interface{ Sync() error }); ok {
-			syncer.Sync()
+			if serr := syncer.Sync(); serr != nil {
+				return serr
+			}
 		}
 
 		mvr, totalSize, err := OpenMultiVolume(w.recoveryFile.Name(), os.O_RDONLY)
 		if err == nil {
 			r := io.NewSectionReader(mvr, 0, totalSize)
 			par2Bytes, err := par2.GeneratePAR2Stream(r, totalSize, filepath.Base(w.recoveryFile.Name()), w.recoveryPct)
-			mvr.Close()
+			// The volumes were opened read-only to compute the
+			// recovery data and are of no further use.
+			_ = mvr.Close()
 			if err == nil && len(par2Bytes) > 0 {
 				fh := &FileHeader{
 					Name:               ".recovery.par2",
@@ -279,11 +311,20 @@ func (w *Writer) Close() error {
 				fh.injectAutoExtras()
 				h := &header{
 					FileHeader: fh,
-					offset:     uint64(w.cw.count),
-					raw:        true,
+					// #nosec G115 -- count is how many bytes this writer has written and does not go below zero
+					offset: uint64(w.cw.count),
+					raw:    true,
 				}
-				if err := writeHeader(w.cw, h); err == nil {
-					w.cw.Write(par2Bytes)
+				if err := writeHeader(w.cw, h); err != nil {
+					return err
+				}
+				// The entry's header has already been written, so
+				// a body that does not follow it leaves an archive
+				// whose recovery entry is a header and nothing
+				// else -- and the caller was told the archive was
+				// closed successfully.
+				if _, werr := w.cw.Write(par2Bytes); werr != nil {
+					return werr
 				}
 			}
 		}
@@ -300,17 +341,26 @@ func (w *Writer) Close() error {
 		if _, err := aesW.Write(cdBuf.Bytes()); err != nil {
 			return err
 		}
-		aesW.Close()
+		// Closing the AES writer is what appends the authentication
+		// code over the encrypted central directory. Without it the
+		// archive has a directory no reader can authenticate, and the
+		// caller was told the archive closed cleanly.
+		if cerr := aesW.Close(); cerr != nil {
+			return cerr
+		}
 	}
 
 	end := w.cw.count
 
 	records := uint64(len(w.dir))
+	// #nosec G115 -- end is where writing the directory left off and start is where it began, so the difference is not negative
 	size := uint64(end - start)
+	// #nosec G115 -- start is a count of bytes written by this writer and does not go below zero
 	offset := uint64(start)
 
 	var unencryptedSize uint64
 	if w.encryptCD && cdBuf != nil {
+		// #nosec G115 -- the length of a buffer is never negative
 		unencryptedSize = uint64(cdBuf.Len())
 	}
 
@@ -351,6 +401,7 @@ func (w *Writer) Close() error {
 
 		b.uint32(directory64LocSignature)
 		b.uint32(0)
+		// #nosec G115 -- end is a count of bytes written by this writer and does not go below zero
 		b.uint64(uint64(end))
 		b.uint32(1)
 
@@ -371,6 +422,7 @@ func (w *Writer) Close() error {
 	b.uint16(uint16(records))
 	b.uint32(uint32(size))
 	b.uint32(uint32(offset))
+	// #nosec G115 -- SetComment refuses a comment over uint16max, and the torrentzip comment is a fixed 22 bytes
 	b.uint16(uint16(len(w.comment)))
 	if _, err := w.cw.Write(buf[:]); err != nil {
 		return err
@@ -463,6 +515,7 @@ func (w *Writer) CreateHeader(fh *FileHeader) (io.Writer, error) {
 	)
 	h := &header{
 		FileHeader: fh,
+		// #nosec G115 -- count is how many bytes this writer has written and does not go below zero
 		offset:     uint64(w.cw.count),
 		torrentZip: w.torrentZip,
 	}
@@ -497,7 +550,9 @@ func (w *Writer) CreateHeader(fh *FileHeader) (io.Writer, error) {
 	} else {
 		if w.forceNoDescriptor {
 			fh.Flags &^= 0x8
+			// #nosec G115 -- zip64 sentinel: uint32max marks "size is in the zip64 extra", not a value
 			fh.CompressedSize = uint32(min(fh.UncompressedSize64, uint32max))
+			// #nosec G115 -- zip64 sentinel: uint32max marks "size is in the zip64 extra", not a value
 			fh.UncompressedSize = uint32(min(fh.UncompressedSize64, uint32max))
 			fh.CompressedSize64 = fh.UncompressedSize64
 		} else {
@@ -575,13 +630,10 @@ func (w *Writer) CreateHeader(fh *FileHeader) (io.Writer, error) {
 }
 
 func writeHeader(w io.Writer, h *header) error {
-	const maxUint16 = 1<<16 - 1
-	if len(h.Name) > maxUint16 {
-		return errLongName
-	}
-	if len(h.Extra) > maxUint16 {
-		return errLongExtra
-	}
+	// The name and the extra field are checked below, once the extra field
+	// is the one that will be written: the zip64 record this adds for a
+	// large entry counts toward the same limit, and a check up here passed
+	// an extra field that only went over the limit afterwards.
 
 	var buf [fileHeaderLen]byte
 	b := writeBuf(buf[:])
@@ -594,6 +646,7 @@ func writeHeader(w io.Writer, h *header) error {
 
 	// In streaming mode or when forced by flags, always use Data Descriptor.
 	// This ensures we never need to Seek back to the Local Header.
+	// #nosec G115 -- zip64 sentinel: uint32max marks "size is in the zip64 extra", not a value
 	if h.raw || !h.hasDataDescriptor() {
 		b.uint32(h.CRC32)
 		b.uint32(uint32(min(h.CompressedSize64, uint32max)))
@@ -601,7 +654,9 @@ func writeHeader(w io.Writer, h *header) error {
 	} else {
 		if h.Method == Store && h.UncompressedSize64 > 0 {
 			b.uint32(0)
+			// #nosec G115 -- zip64 sentinel: uint32max marks "size is in the zip64 extra", not a value
 			b.uint32(uint32(min(h.CompressedSize64, uint32max)))
+			// #nosec G115 -- zip64 sentinel: uint32max marks "size is in the zip64 extra", not a value
 			b.uint32(uint32(min(h.UncompressedSize64, uint32max)))
 		} else {
 			b.uint32(0)
@@ -637,15 +692,23 @@ func writeHeader(w io.Writer, h *header) error {
 		}
 	}
 
-	b.uint16(uint16(len(h.Name)))
-	b.uint16(uint16(len(extra)))
+	nameLen, err := fitUint16(len(h.Name), "file name")
+	if err != nil {
+		return err
+	}
+	extraLen, err := fitUint16(len(extra), "extra field")
+	if err != nil {
+		return err
+	}
+	b.uint16(nameLen)
+	b.uint16(extraLen)
 	if _, err := w.Write(buf[:]); err != nil {
 		return err
 	}
 	if _, err := io.WriteString(w, h.Name); err != nil {
 		return err
 	}
-	_, err := w.Write(extra)
+	_, err = w.Write(extra)
 	return err
 }
 
@@ -654,7 +717,9 @@ func (w *Writer) CreateRaw(fh *FileHeader) (io.Writer, error) {
 		return nil, err
 	}
 
+	// #nosec G115 -- zip64 sentinel: uint32max marks "size is in the zip64 extra", not a value
 	fh.CompressedSize = uint32(min(fh.CompressedSize64, uint32max))
+	// #nosec G115 -- zip64 sentinel: uint32max marks "size is in the zip64 extra", not a value
 	fh.UncompressedSize = uint32(min(fh.UncompressedSize64, uint32max))
 
 	if w.torrentZip {
@@ -681,6 +746,7 @@ func (w *Writer) CreateRaw(fh *FileHeader) (io.Writer, error) {
 
 	h := &header{
 		FileHeader: fh,
+		// #nosec G115 -- count is how many bytes this writer has written and does not go below zero
 		offset:     uint64(w.cw.count),
 		raw:        true,
 		torrentZip: w.torrentZip,
@@ -772,7 +838,9 @@ func (w *Writer) AddFS(fsys fs.FS) error {
 		if err != nil {
 			return err
 		}
-		defer f.Close()
+		// A file being read into the archive; nothing is written
+		// through this handle.
+		defer func() { _ = f.Close() }()
 		_, err = io.CopyBuffer(fw, f, copyBuf)
 		return err
 	})
@@ -835,19 +903,21 @@ func (w *fileWriter) close() error {
 		}
 	}
 
-	if !w.header.torrentZip {
-		w.header.injectAutoExtras()
+	if !w.torrentZip {
+		w.injectAutoExtras()
 	} else {
-		w.header.Extra = nil
+		w.Extra = nil
 	}
 
-	fh := w.header.FileHeader
+	fh := w.FileHeader
 	if w.isAES {
 		fh.CRC32 = 0 // AE-2 dictates that CRC is 0
 	} else {
 		fh.CRC32 = w.crc32.Sum32()
 	}
+	// #nosec G115 -- both are counts of bytes this writer produced and neither goes below zero
 	fh.CompressedSize64 = uint64(w.compCount.count)
+	// #nosec G115 -- both are counts of bytes this writer produced and neither goes below zero
 	fh.UncompressedSize64 = uint64(w.rawCount.count)
 
 	if fh.isZip64() {
@@ -855,7 +925,9 @@ func (w *fileWriter) close() error {
 		fh.UncompressedSize = uint32max
 		fh.ReaderVersion = zipVersion45
 	} else {
+		// #nosec G115 -- isZip64 is false, so both sizes are below uint32max
 		fh.CompressedSize = uint32(fh.CompressedSize64)
+		// #nosec G115 -- isZip64 is false, so both sizes are below uint32max
 		fh.UncompressedSize = uint32(fh.UncompressedSize64)
 	}
 
@@ -863,7 +935,7 @@ func (w *fileWriter) close() error {
 		return err
 	}
 
-	if w.header.SeekChunkSize > 0 && w.header.Method != Store {
+	if w.SeekChunkSize > 0 && w.Method != Store {
 		if err := w.writeHiddenIndex(); err != nil {
 			return err
 		}
@@ -876,7 +948,7 @@ func (w *fileWriter) writeHiddenIndex() error {
 	var payload []byte
 	var ext string
 
-	if w.header.SeekContinuous {
+	if w.SeekContinuous {
 		ext = ".gzidx"
 		payload = w.buildGZIDX()
 	} else {
@@ -884,7 +956,7 @@ func (w *fileWriter) writeHiddenIndex() error {
 		payload = w.buildSOZip()
 	}
 
-	dir, name := path.Split(w.header.Name)
+	dir, name := path.Split(w.Name)
 	hiddenName := dir + "." + name + ext
 
 	fh := &FileHeader{
@@ -897,8 +969,9 @@ func (w *fileWriter) writeHiddenIndex() error {
 
 	h := &header{
 		FileHeader: fh,
-		offset:     uint64(w.zipw.(*countWriter).count),
-		raw:        true,
+		// #nosec G115 -- count is how many bytes this writer has written and does not go below zero
+		offset: uint64(w.zipw.(*countWriter).count),
+		raw:    true,
 	}
 
 	if err := writeHeader(w.zipw, h); err != nil {
@@ -910,53 +983,59 @@ func (w *fileWriter) writeHiddenIndex() error {
 	return nil
 }
 
+// buildSOZip lays out the SOZip index payload. Appending to a byte slice
+// rather than writing into a buffer keeps the header fields as what they are,
+// fixed-width little-endian numbers, and leaves no error to swallow: a
+// bytes.Buffer never fails a write, but the call still returned one.
 func (w *fileWriter) buildSOZip() []byte {
-	buf := new(bytes.Buffer)
-	buf.Grow(32 + (len(w.header.SeekIndex)-1)*8)
+	buf := make([]byte, 0, 32+(len(w.SeekIndex)-1)*8)
 
-	binary.Write(buf, binary.LittleEndian, uint32(1))
-	binary.Write(buf, binary.LittleEndian, uint32(0))
-	binary.Write(buf, binary.LittleEndian, uint32(w.header.SeekChunkSize))
-	binary.Write(buf, binary.LittleEndian, uint32(8))
-	binary.Write(buf, binary.LittleEndian, uint64(w.header.UncompressedSize64))
-	binary.Write(buf, binary.LittleEndian, uint64(w.header.CompressedSize64))
+	buf = binary.LittleEndian.AppendUint32(buf, 1)
+	buf = binary.LittleEndian.AppendUint32(buf, 0)
+	buf = binary.LittleEndian.AppendUint32(buf, w.SeekChunkSize)
+	buf = binary.LittleEndian.AppendUint32(buf, 8)
+	buf = binary.LittleEndian.AppendUint64(buf, w.UncompressedSize64)
+	buf = binary.LittleEndian.AppendUint64(buf, w.CompressedSize64)
 
-	for i := 1; i < len(w.header.SeekIndex); i++ {
-		binary.Write(buf, binary.LittleEndian, uint64(w.header.SeekIndex[i]))
+	for i := 1; i < len(w.SeekIndex); i++ {
+		buf = binary.LittleEndian.AppendUint64(buf, w.SeekIndex[i])
 	}
-	return buf.Bytes()
+	return buf
 }
 
+// buildGZIDX lays out the GZIDX index payload, appending to a byte slice for
+// the same reasons as buildSOZip.
 func (w *fileWriter) buildGZIDX() []byte {
-	buf := new(bytes.Buffer)
-	buf.Write([]byte("GZIDX"))
-	buf.WriteByte(1) // version
-	buf.WriteByte(0) // flags
+	const windowSize = 32768
+	buf := make([]byte, 0, 35+len(w.GzidxPoints)*(18+windowSize))
+	buf = append(buf, "GZIDX"...)
+	buf = append(buf, 1) // version
+	buf = append(buf, 0) // flags
 
-	binary.Write(buf, binary.LittleEndian, uint64(w.header.CompressedSize64))
-	binary.Write(buf, binary.LittleEndian, uint64(w.header.UncompressedSize64))
-	binary.Write(buf, binary.LittleEndian, uint32(w.header.SeekChunkSize))
-	binary.Write(buf, binary.LittleEndian, uint32(32768)) // windowSize
-	binary.Write(buf, binary.LittleEndian, uint32(len(w.header.GzidxPoints)))
+	buf = binary.LittleEndian.AppendUint64(buf, w.CompressedSize64)
+	buf = binary.LittleEndian.AppendUint64(buf, w.UncompressedSize64)
+	buf = binary.LittleEndian.AppendUint32(buf, w.SeekChunkSize)
+	buf = binary.LittleEndian.AppendUint32(buf, windowSize)
+	// #nosec G115 -- every point carries a 32 KiB window in memory, so a count too large for this field would mean an index of some 140 TB held in this process
+	buf = binary.LittleEndian.AppendUint32(buf, uint32(len(w.GzidxPoints)))
 
-	for _, pt := range w.header.GzidxPoints {
-		binary.Write(buf, binary.LittleEndian, pt.compOffset)
-		binary.Write(buf, binary.LittleEndian, pt.uncompOffset)
-		buf.WriteByte(pt.bits)
-		buf.WriteByte(pt.hasData)
+	for _, pt := range w.GzidxPoints {
+		buf = binary.LittleEndian.AppendUint64(buf, pt.compOffset)
+		buf = binary.LittleEndian.AppendUint64(buf, pt.uncompOffset)
+		buf = append(buf, pt.bits, pt.hasData)
 	}
-	for _, pt := range w.header.GzidxPoints {
+	for _, pt := range w.GzidxPoints {
 		if pt.hasData == 1 {
-			if len(pt.window) == 32768 {
-				buf.Write(pt.window)
+			if len(pt.window) == windowSize {
+				buf = append(buf, pt.window...)
 			} else {
-				pad := make([]byte, 32768)
-				copy(pad[32768-len(pt.window):], pt.window)
-				buf.Write(pad)
+				pad := make([]byte, windowSize)
+				copy(pad[windowSize-len(pt.window):], pt.window)
+				buf = append(buf, pad...)
 			}
 		}
 	}
-	return buf.Bytes()
+	return buf
 }
 
 func (w *fileWriter) writeDataDescriptor() error {
@@ -973,7 +1052,7 @@ func (w *fileWriter) writeDataDescriptor() error {
 	b.uint32(dataDescriptorSignature)
 
 	// For AES files, header.CRC32 is already 0
-	b.uint32(w.header.CRC32)
+	b.uint32(w.CRC32)
 	if w.isZip64() {
 		b.uint64(w.CompressedSize64)
 		b.uint64(w.UncompressedSize64)

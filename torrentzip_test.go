@@ -18,41 +18,52 @@ import (
 func TestArchiver_TorrentZip(t *testing.T) {
 	tmp := t.TempDir()
 	src := filepath.Join(tmp, "src")
-	os.MkdirAll(filepath.Join(src, "dir2"), 0755)
-	os.MkdirAll(filepath.Join(src, "dir1"), 0755) // This one will have a file
-	os.WriteFile(filepath.Join(src, "dir1", "file.txt"), []byte("file data"), 0644)
-	os.WriteFile(filepath.Join(src, "Z_file.txt"), []byte("data Z"), 0644)
-	os.WriteFile(filepath.Join(src, "a_file.txt"), []byte("data a"), 0644)
+	mustMkdirAll(t, filepath.Join(src, "dir2"))
+	mustMkdirAll(t, filepath.Join(src, "dir1")) // This one will have a file
+	mustWriteFile(t, filepath.Join(src, "dir1", "file.txt"), []byte("file data"), 0644)
+	mustWriteFile(t, filepath.Join(src, "Z_file.txt"), []byte("data Z"), 0644)
+	mustWriteFile(t, filepath.Join(src, "a_file.txt"), []byte("data a"), 0644)
 
 	zipPath := filepath.Join(tmp, "tz.zip")
-	f, _ := os.Create(zipPath)
+	f, err := os.Create(zipPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closeAt(t, f)
 
 	a, err := NewArchiver(f, src, WithArchiverTorrentZip(true))
 	if err != nil {
 		t.Fatal(err)
 	}
+	closeAt(t, a)
 
 	files := make(map[string]os.FileInfo)
-	filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
+	if err := filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
 		if path != src {
 			files[path] = info
 		}
 		return nil
-	})
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	err = a.Archive(context.Background(), files)
 	if err != nil {
 		t.Fatal(err)
 	}
-	a.Close()
-	f.Close()
+	if err := a.Close(); err != nil {
+		t.Fatalf("close archiver: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close %s: %v", zipPath, err)
+	}
 
 	// Check properties
 	zr, err := OpenReader(zipPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer zr.Close()
+	closeAt(t, zr)
 
 	if !strings.HasPrefix(zr.Comment, "TORRENTZIPPED-") {
 		t.Errorf("expected TORRENTZIPPED- comment, got %q", zr.Comment)
@@ -152,10 +163,15 @@ func TestWithArchiverTorrentZip_SetsLevel9(t *testing.T) {
 func TestTorrentZip_BitExactWithReference(t *testing.T) {
 	tmp := t.TempDir()
 
-	// 1. Проверяем наличие "trrntzip" или "torrentzip" в PATH
+	// 1. Проверяем наличие "trrntzip" или "torrentzip" в PATH.
+	// A lookup that reports an error has named nothing usable, so the path is
+	// left empty and the build from the sibling checkout below takes over.
 	trrntzipPath, err := exec.LookPath("trrntzip")
 	if err != nil {
 		trrntzipPath, err = exec.LookPath("torrentzip")
+	}
+	if err != nil {
+		trrntzipPath = ""
 	}
 
 	var buildErr error
@@ -186,22 +202,22 @@ func TestTorrentZip_BitExactWithReference(t *testing.T) {
 
 	// 2. Подготовка файлов для архивации
 	srcDir := filepath.Join(tmp, "src")
-	os.MkdirAll(filepath.Join(srcDir, "dir1"), 0755)
+	mustMkdirAll(t, filepath.Join(srcDir, "dir1"))
 
 	// Создаем большой файл (655360 байт, типичный TRD образ),
 	// который будет сжиматься по-разному в Go flate и C zlib
 	var buf bytes.Buffer
 	for buf.Len() < 655360 {
-		buf.WriteString(fmt.Sprintf("This is some highly structured and repeating data that will test the LZ77 match finder differences between standard Go flate and C zlib. Line number: %d\n", buf.Len()))
+		fmt.Fprintf(&buf, "This is some highly structured and repeating data that will test the LZ77 match finder differences between standard Go flate and C zlib. Line number: %d\n", buf.Len())
 	}
 
-	os.WriteFile(filepath.Join(srcDir, "Aaargh!.trd"), buf.Bytes()[:655360], 0644)
-	os.WriteFile(filepath.Join(srcDir, "dir1", "file.txt"), []byte("highly structured and repeatable test data"), 0644)
-	os.WriteFile(filepath.Join(srcDir, "a.txt"), []byte("some other file content"), 0644)
-	os.MkdirAll(filepath.Join(srcDir, "empty_dir"), 0755)                     // Пустая директория
-	os.WriteFile(filepath.Join(srcDir, "empty_file.txt"), []byte{}, 0644)     // Пустой регулярный файл
-	os.WriteFile(filepath.Join(srcDir, "Z_file.txt"), []byte("data Z"), 0644) // Проверка регистронезависимой сортировки
-	os.WriteFile(filepath.Join(srcDir, "a_file.txt"), []byte("data a"), 0644)
+	mustWriteFile(t, filepath.Join(srcDir, "Aaargh!.trd"), buf.Bytes()[:655360], 0644)
+	mustWriteFile(t, filepath.Join(srcDir, "dir1", "file.txt"), []byte("highly structured and repeatable test data"), 0644)
+	mustWriteFile(t, filepath.Join(srcDir, "a.txt"), []byte("some other file content"), 0644)
+	mustMkdirAll(t, filepath.Join(srcDir, "empty_dir"))                           // Пустая директория
+	mustWriteFile(t, filepath.Join(srcDir, "empty_file.txt"), []byte{}, 0644)     // Пустой регулярный файл
+	mustWriteFile(t, filepath.Join(srcDir, "Z_file.txt"), []byte("data Z"), 0644) // Проверка регистронезависимой сортировки
+	mustWriteFile(t, filepath.Join(srcDir, "a_file.txt"), []byte("data a"), 0644)
 
 	// 3. Создаем TorrentZip через НАШ архиватор
 	goZipPath := filepath.Join(tmp, "go_torrent.zip")
@@ -209,25 +225,33 @@ func TestTorrentZip_BitExactWithReference(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	closeAt(t, fGo)
 
 	a, err := NewArchiver(fGo, srcDir, WithArchiverTorrentZip(true))
 	if err != nil {
 		t.Fatal(err)
 	}
+	closeAt(t, a)
 
 	files := make(map[string]os.FileInfo)
-	filepath.Walk(srcDir, func(path string, info os.FileInfo, err error) error {
+	if err := filepath.Walk(srcDir, func(path string, info os.FileInfo, err error) error {
 		if path != srcDir {
 			files[path] = info
 		}
 		return nil
-	})
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	if err := a.Archive(context.Background(), files); err != nil {
 		t.Fatal(err)
 	}
-	a.Close()
-	fGo.Close()
+	if err := a.Close(); err != nil {
+		t.Fatalf("close archiver: %v", err)
+	}
+	if err := fGo.Close(); err != nil {
+		t.Fatalf("close %s: %v", goZipPath, err)
+	}
 
 	// 4. Копируем наш архив в ref_torrent.zip и напускаем на него эталонный torrentzip
 	refZipPath := filepath.Join(tmp, "ref_torrent.zip")
@@ -236,16 +260,20 @@ func TestTorrentZip_BitExactWithReference(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	closeAt(t, in)
 	out, err := os.Create(refZipPath)
 	if err != nil {
-		in.Close()
 		t.Fatal(err)
 	}
-	_, err = io.Copy(out, in)
-	in.Close()
-	out.Close()
-	if err != nil {
+	closeAt(t, out)
+	if _, err := io.Copy(out, in); err != nil {
 		t.Fatal(err)
+	}
+	if err := in.Close(); err != nil {
+		t.Fatalf("close %s: %v", goZipPath, err)
+	}
+	if err := out.Close(); err != nil {
+		t.Fatalf("close %s: %v", refZipPath, err)
 	}
 
 	// Запуск эталонного torrentzip для конвертации
@@ -286,7 +314,13 @@ func TestTorrentZip_BitExactWithReference(t *testing.T) {
 
 		// Сбор диагностической информации по обоим архивам
 		zrGo, errGo := OpenReader(goZipPath)
+		if errGo == nil {
+			closeAt(t, zrGo)
+		}
 		zrRef, errRef := OpenReader(refZipPath)
+		if errRef == nil {
+			closeAt(t, zrRef)
+		}
 
 		if errGo == nil && errRef == nil {
 			t.Logf("--- DIAGNOSTICS: OUR ZIP (%d entries) ---", len(zrGo.File))
@@ -300,9 +334,6 @@ func TestTorrentZip_BitExactWithReference(t *testing.T) {
 				t.Logf("File: %q | Method: %d | CompSize: %d | UncompSize: %d | CRC32: %08X | Flags: %d | Extra: %d bytes",
 					f.Name, f.Method, f.CompressedSize64, f.UncompressedSize64, f.CRC32, f.Flags, len(f.Extra))
 			}
-
-			zrGo.Close()
-			zrRef.Close()
 		}
 
 		if len(goBytes) == len(refBytes) {
@@ -334,8 +365,10 @@ func TestTorrentZip_SlashNormalization(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	w.Write([]byte("data"))
-	zw.Close()
+	mustWrite(t, w, []byte("data"))
+	if err := zw.Close(); err != nil {
+		t.Fatalf("close writer: %v", err)
+	}
 
 	// Проверяем результат
 	zr, err := NewReader(bytes.NewReader(buf.Bytes()), int64(buf.Len()))

@@ -54,6 +54,10 @@ func buildHuffmanTree(freqs []uint32, maxDepth int, lengths []byte) {
 		rightIdx := active[1]
 
 		parentIdx := len(treeNodes)
+		// #nosec G115 -- treeNodes holds one leaf per used symbol plus one
+		// parent per merge. The largest table passed in has
+		// kFixedMainTableSize (288) symbols, so at most 575 nodes exist and
+		// every index fits in int16.
 		parent := huffNode{
 			weight: treeNodes[leftIdx].weight + treeNodes[rightIdx].weight,
 			symbol: -1,
@@ -144,7 +148,7 @@ func generateCodes(lengths []byte, codes []uint32) {
 	var nextCode [17]uint32
 	var code uint32 = 0
 
-	var count [17]int
+	var count [17]uint32
 	for _, l := range lengths {
 		if l > 0 {
 			count[l]++
@@ -152,7 +156,7 @@ func generateCodes(lengths []byte, codes []uint32) {
 	}
 
 	for bits := 1; bits <= 16; bits++ {
-		code = (code + uint32(count[bits-1])) << 1
+		code = (code + count[bits-1]) << 1
 		nextCode[bits] = code
 	}
 

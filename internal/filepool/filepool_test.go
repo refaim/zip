@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"testing"
+	"time"
 )
 
 func TestFilePool_Basic(t *testing.T) {
@@ -29,7 +30,9 @@ func TestFilePool_Basic(t *testing.T) {
 		t.Errorf("Expected 10 written bytes, got %d", f1.Written())
 	}
 
-	f1.Hasher().Write([]byte("hello pool"))
+	if _, err := f1.Hasher().Write([]byte("hello pool")); err != nil {
+		t.Fatalf("Failed to write to the pool file's hasher: %v", err)
+	}
 	if f1.Checksum() == 0 {
 		t.Error("Expected non-zero checksum")
 	}
@@ -43,14 +46,18 @@ func TestFilePool_Basic(t *testing.T) {
 		t.Errorf("Expected 'hello pool', got %q", string(buf[:n]))
 	}
 
-	fp.Put(f1)
+	if err := fp.Put(f1); err != nil {
+		t.Fatalf("Put failed: %v", err)
+	}
 
 	// Verify that the file was reset
 	f2 := fp.Get()
 	if f2.Written() != 0 {
 		t.Errorf("Expected file to be reset, but written size is %d", f2.Written())
 	}
-	fp.Put(f2)
+	if err := fp.Put(f2); err != nil {
+		t.Fatalf("Put failed: %v", err)
+	}
 
 	err = fp.Close()
 	if err != nil {
@@ -73,10 +80,22 @@ func TestFilePool_WritePastBuffer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer fp.Close()
+	// The pool owns the temp file the write below forces it to create, and
+	// this is the only close of it: a t.Fatal in the middle would otherwise
+	// leave the handle open across the removal of tmpDir. The helpers of
+	// package zip are not visible here, so the net is spelled out.
+	t.Cleanup(func() {
+		if err := fp.Close(); err != nil {
+			t.Errorf("Failed to close file pool: %v", err)
+		}
+	})
 
 	f := fp.Get()
-	defer fp.Put(f)
+	t.Cleanup(func() {
+		if err := fp.Put(f); err != nil {
+			t.Errorf("Put failed: %v", err)
+		}
+	})
 
 	data := []byte("this data exceeds the small buffer size of 4 bytes")
 	n, err := f.Write(data)
@@ -135,16 +154,29 @@ func TestFilePool_CleanupOnClose(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The test closes the pool itself below -- that close is what it asserts
+	// on. This is only the net for the physical file the write creates, so
+	// that a t.Fatal before that point still releases it; closing an already
+	// closed pool is a no-op.
+	t.Cleanup(func() {
+		if err := fp.Close(); err != nil {
+			t.Errorf("Failed to close file pool: %v", err)
+		}
+	})
 
 	f := fp.Get()
-	f.Write([]byte("exceed buffer size to create physical file"))
+	if _, err := f.Write([]byte("exceed buffer size to create physical file")); err != nil {
+		t.Fatalf("Write failed: %v", err)
+	}
 
 	physicalName := f.f.Name()
 	if _, err := os.Stat(physicalName); os.IsNotExist(err) {
 		t.Fatalf("Physical file %s was not created", physicalName)
 	}
 
-	fp.Put(f)
+	if err := fp.Put(f); err != nil {
+		t.Fatalf("Put failed: %v", err)
+	}
 
 	err = fp.Close()
 	if err != nil {
@@ -153,5 +185,53 @@ func TestFilePool_CleanupOnClose(t *testing.T) {
 
 	if _, err := os.Stat(physicalName); err == nil {
 		t.Errorf("Physical file %s was not deleted during cleanup", physicalName)
+	}
+}
+
+// TestFilePool_PutReportsAFailedTruncate covers the one thing Put does that
+// can fail. Returning a file to the pool empties it; when the emptying does
+// not happen the file still carries the bytes of the entry before it, and the
+// caller that hands it back is the last one in a position to notice.
+func TestFilePool_PutReportsAFailedTruncate(t *testing.T) {
+	tmpDir := t.TempDir()
+	fp, err := New(tmpDir, 1, 4)
+	if err != nil {
+		t.Fatalf("Failed to create file pool: %v", err)
+	}
+
+	f := fp.Get()
+	if _, err := f.Write([]byte("more than four bytes, so a file is made")); err != nil {
+		t.Fatalf("Write failed: %v", err)
+	}
+	if f.f == nil {
+		t.Fatal("expected the write to spill into a file")
+	}
+	name := f.f.Name()
+
+	// Closing the handle is the cheapest way to make a truncate fail on
+	// every platform the pool runs on.
+	if err := f.f.Close(); err != nil {
+		t.Fatalf("closing the pool file failed: %v", err)
+	}
+
+	if err := fp.Put(f); err == nil {
+		t.Fatal("Put reported success although the pool file was not emptied")
+	}
+
+	// The file still has to go back to the pool: a caller that stops using
+	// the pool because one file misbehaved would deadlock on the next Get.
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		fp.Get()
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Put did not return the file to the pool")
+	}
+
+	if err := os.Remove(name); err != nil && !os.IsNotExist(err) {
+		t.Errorf("removing the pool file failed: %v", err)
 	}
 }

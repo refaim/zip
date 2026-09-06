@@ -15,7 +15,9 @@ func TestZipCrypto_Read(t *testing.T) {
 	zw := NewWriter(buf)
 	// The current Writer does not support writing encryption (it's more complex),
 	// so we only test the decoder logic.
-	zw.Close()
+	if err := zw.Close(); err != nil {
+		t.Fatalf("close writer: %v", err)
+	}
 
 	// Key verification
 	crypto := newZipCrypto([]byte(password))

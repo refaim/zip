@@ -21,6 +21,7 @@ func getHardLinkTarget(fi os.FileInfo, seen map[hardlinkKey]string) string {
 	if !ok || sys.Nlink <= 1 {
 		return ""
 	}
+	// #nosec G115 -- the pair is only a map key: dev is put in the same way at every call site and the result is never read as a number, only compared with another key built here, so what the bits mean is immaterial
 	key := hardlinkKey{dev: uint64(sys.Dev), ino: uint64(sys.Ino)}
 	if target, exists := seen[key]; exists {
 		return target
@@ -33,6 +34,7 @@ func rememberHardLink(fi os.FileInfo, relPath string, seen map[hardlinkKey]strin
 	if !ok || sys.Nlink <= 1 {
 		return
 	}
+	// #nosec G115 -- the pair is only a map key: dev is put in the same way at every call site and the result is never read as a number, only compared with another key built here, so what the bits mean is immaterial
 	key := hardlinkKey{dev: uint64(sys.Dev), ino: uint64(sys.Ino)}
 	if _, exists := seen[key]; !exists {
 		seen[key] = relPath
@@ -107,6 +109,6 @@ func lookupGroup(name string) (int, error) {
 	resolveMut.Unlock()
 	return id, nil
 }
-func createWindowsSymlink(target, link string, isDir bool) error {
+func createWindowsSymlink(target, resolved, link string, isDir bool, eb *entryBudget) error {
 	return nil // No-op on Unix, never called due to runtime.GOOS check
 }

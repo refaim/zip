@@ -29,6 +29,7 @@ func newPPMdReader(r io.Reader, size uint64) io.ReadCloser {
 		return errorReader{fmt.Errorf("zip: PPMd memory limit exceeded (%d MB)", memSize)}
 	}
 
+	// #nosec G115 -- the build tag above keeps this file on 64-bit targets, where int holds the UncompressedSize64 <= MaxInt64 that readDirectoryHeader lets through
 	rd, err := ppmd.NewH7zReader(r, order, memSize, int(size))
 	if err != nil {
 		return errorReader{err}

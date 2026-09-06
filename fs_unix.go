@@ -119,3 +119,8 @@ func appendPlatformExtra(fi os.FileInfo, hdr *FileHeader, force bool) {
 	}
 	sysPlatformExtra(fi, hdr)
 }
+
+// removeHeldElsewhere has nothing to report off Windows: unlinking a file that
+// another process holds open is what unlink does there, and the name goes away
+// whatever else is reading it.
+func removeHeldElsewhere(error) bool { return false }

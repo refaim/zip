@@ -3,12 +3,33 @@ package zip
 import (
 	"bytes"
 	"crypto/rand"
+	"errors"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"testing"
 )
+
+// cutoffWriter accepts limit bytes and fails every write past that, the way a
+// full disk does. The bit writer buffers a megabyte before it touches the
+// underlying writer, so a test that wants to see a write error at all has to
+// push more than that through the encoder.
+type cutoffWriter struct {
+	limit   int
+	written int
+	err     error
+}
+
+func (cw *cutoffWriter) Write(p []byte) (int, error) {
+	room := cw.limit - cw.written
+	if len(p) <= room {
+		cw.written += len(p)
+		return len(p), nil
+	}
+	cw.written += room
+	return room, cw.err
+}
 
 func TestDeflate64Encoder_Roundtrip(t *testing.T) {
 	// Full cycle roundtrip testing (compression -> decompression)
@@ -41,7 +62,7 @@ func TestDeflate64Encoder_Roundtrip(t *testing.T) {
 
 	// 2. Decompress using our Deflate64 decoder
 	decoder := decodeDeflate64(compressedBuf)
-	defer decoder.Close()
+	closeAt(t, decoder)
 
 	decompressedData, err := io.ReadAll(decoder)
 	if err != nil {
@@ -63,7 +84,7 @@ func TestDeflate64Encoder_Empty(t *testing.T) {
 	}
 
 	decoder := decodeDeflate64(buf)
-	defer decoder.Close()
+	closeAt(t, decoder)
 
 	data, err := io.ReadAll(decoder)
 	if err != nil {
@@ -94,6 +115,7 @@ func TestDeflate64_External7zBidirectional(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	closeAt(t, f)
 	zw := NewWriter(f)
 	w, err := zw.CreateHeader(&FileHeader{
 		Name:   "test.txt",
@@ -102,9 +124,13 @@ func TestDeflate64_External7zBidirectional(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	w.Write(srcData)
-	zw.Close()
-	f.Close()
+	mustWrite(t, w, srcData)
+	if err := zw.Close(); err != nil {
+		t.Fatalf("Writer close failed: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close %s: %v", zipPath, err)
+	}
 
 	extractedDir := filepath.Join(tmpDir, "7z_extracted")
 	cmd := exec.Command(p7zPath, "x", "-o"+extractedDir, zipPath)
@@ -134,10 +160,12 @@ func TestDeflate64_ExtremeAllZeros(t *testing.T) {
 	if n != len(srcData) {
 		t.Fatalf("Expected %d bytes written, got %d", len(srcData), n)
 	}
-	encoder.Close()
+	if err := encoder.Close(); err != nil {
+		t.Fatalf("Encoder close failed: %v", err)
+	}
 
 	decoder := decodeDeflate64(buf)
-	defer decoder.Close()
+	closeAt(t, decoder)
 
 	decompressed, err := io.ReadAll(decoder)
 	if err != nil {
@@ -164,11 +192,13 @@ func TestDeflate64_BoundaryDistances(t *testing.T) {
 
 	buf := new(bytes.Buffer)
 	encoder := newDeflate64Writer(buf)
-	encoder.Write(srcData)
-	encoder.Close()
+	mustWrite(t, encoder, srcData)
+	if err := encoder.Close(); err != nil {
+		t.Fatalf("Encoder close failed: %v", err)
+	}
 
 	decoder := decodeDeflate64(buf)
-	defer decoder.Close()
+	closeAt(t, decoder)
 
 	decompressed, err := io.ReadAll(decoder)
 	if err != nil {
@@ -176,5 +206,66 @@ func TestDeflate64_BoundaryDistances(t *testing.T) {
 	}
 	if !bytes.Equal(decompressed, srcData) {
 		t.Error("Decompressed boundary stream do not match original data")
+	}
+}
+
+// TestBitWriter_LatchesWriteError pins that a byte the bit writer cannot hand
+// to the output stream is not lost silently: the first error is kept and
+// reported to whoever flushes.
+func TestBitWriter_LatchesWriteError(t *testing.T) {
+	want := errors.New("no space left on device")
+	bw := newBitWriter(&cutoffWriter{err: want})
+
+	// The bit writer buffers a megabyte, so write two before expecting the
+	// underlying writer to have been touched at all.
+	for i := 0; i < 1<<19; i++ {
+		bw.writeBits(0xFFFFFFFF, 32)
+	}
+	if !errors.Is(bw.err, want) {
+		t.Fatalf("writeBits swallowed the write error, latched %v", bw.err)
+	}
+
+	// Leave a partial byte behind so the flush has one more byte to emit, and
+	// check the error still comes back from it.
+	bw.writeBits(1, 3)
+	if err := bw.flushBits(); !errors.Is(err, want) {
+		t.Fatalf("flushBits returned %v, want %v", err, want)
+	}
+}
+
+// TestDeflate64Writer_CloseReportsWriteError covers the small stream case,
+// where nothing reaches the output until Close flushes it.
+func TestDeflate64Writer_CloseReportsWriteError(t *testing.T) {
+	want := errors.New("no space left on device")
+	encoder := newDeflate64Writer(&cutoffWriter{err: want})
+
+	mustWrite(t, encoder, []byte("a block small enough to sit in the buffer"))
+
+	if err := encoder.Close(); !errors.Is(err, want) {
+		t.Fatalf("Close returned %v, want %v", err, want)
+	}
+}
+
+// TestDeflate64Writer_WriteReportsWriteError covers the streaming case: the
+// output dies part way through, and the caller of Write has to hear about it
+// rather than get a corrupt archive with no error.
+func TestDeflate64Writer_WriteReportsWriteError(t *testing.T) {
+	want := errors.New("no space left on device")
+	sink := &cutoffWriter{limit: 1 << 20, err: want}
+	encoder := newDeflate64Writer(sink)
+
+	// Incompressible data, so the encoder has to push past both the megabyte
+	// the sink accepts and the megabyte the bit writer buffers.
+	srcData := make([]byte, 3<<20)
+	if _, err := rand.Read(srcData); err != nil {
+		t.Fatalf("fill source data: %v", err)
+	}
+
+	n, err := encoder.Write(srcData)
+	if !errors.Is(err, want) {
+		t.Fatalf("Write reported %d bytes and error %v, want %v", n, err, want)
+	}
+	if err := encoder.Close(); !errors.Is(err, want) {
+		t.Fatalf("Close returned %v, want %v", err, want)
 	}
 }

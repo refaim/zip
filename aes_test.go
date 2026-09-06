@@ -5,6 +5,7 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/hmac"
+	// #nosec G505 -- WinZip AES (APPNOTE 6.3.x) requires PBKDF2-HMAC-SHA1 and an HMAC-SHA1 authentication code; the test computes the same thing the format does
 	"crypto/sha1"
 	"errors"
 	"io"
@@ -90,8 +91,10 @@ func TestWinZipAES_FullCycle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateHeader failed: %v", err)
 	}
-	w.Write(data)
-	zw.Close()
+	mustWrite(t, w, data)
+	if err := zw.Close(); err != nil {
+		t.Fatalf("close writer: %v", err)
+	}
 
 	// 2. Read and verify
 	zr, err := NewReader(bytes.NewReader(buf.Bytes()), int64(buf.Len()))
@@ -109,9 +112,8 @@ func TestWinZipAES_FullCycle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("f.Open failed: %v", err)
 	}
+	closeAt(t, rc)
 	decrypted, err := io.ReadAll(rc)
-	rc.Close()
-
 	if err != nil {
 		t.Fatalf("ReadAll failed: %v", err)
 	}
@@ -142,9 +144,11 @@ func TestWinZipAES_StrengthsAndStore(t *testing.T) {
 				Password:    password,
 				AESStrength: tc.strength,
 			}
-			w, _ := zw.CreateHeader(fh)
-			w.Write(data)
-			zw.Close()
+			w := mustCreateHeader(t, zw, fh)
+			mustWrite(t, w, data)
+			if err := zw.Close(); err != nil {
+				t.Fatalf("close writer: %v", err)
+			}
 
 			zr, _ := NewReader(bytes.NewReader(buf.Bytes()), int64(buf.Len()))
 			zr.SetPassword(password)
@@ -152,8 +156,11 @@ func TestWinZipAES_StrengthsAndStore(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Open failed: %v", err)
 			}
-			decrypted, _ := io.ReadAll(rc)
-			rc.Close()
+			closeAt(t, rc)
+			decrypted, err := io.ReadAll(rc)
+			if err != nil {
+				t.Fatalf("ReadAll failed: %v", err)
+			}
 
 			if !bytes.Equal(decrypted, data) {
 				t.Errorf("got %q, want %q", string(decrypted), string(data))
@@ -173,17 +180,22 @@ func TestWinZipAES_CorruptedMAC(t *testing.T) {
 		Password:    password,
 		AESStrength: 3,
 	}
-	w, _ := zw.CreateHeader(fh)
-	w.Write(data)
-	zw.Close()
+	w := mustCreateHeader(t, zw, fh)
+	mustWrite(t, w, data)
+	if err := zw.Close(); err != nil {
+		t.Fatalf("close writer: %v", err)
+	}
 
 	raw := buf.Bytes()
 	t.Logf("[DEBUG-TEST] Raw zip size: %d", len(raw))
 	zr, _ := NewReader(bytes.NewReader(raw), int64(len(raw)))
 
 	off, _ := zr.File[0].DataOffset()
-	compSize := zr.File[0].CompressedSize64
-	macOffset := off + int64(compSize) - 5
+	compSize, err := u64toi64(zr.File[0].CompressedSize64)
+	if err != nil {
+		t.Fatalf("compressed size of the entry just written: %v", err)
+	}
+	macOffset := off + compSize - 5
 	t.Logf("[DEBUG-TEST] DataOffset: %d, CompressedSize64: %d, macOffset: %d", off, compSize, macOffset)
 	t.Logf("[DEBUG-TEST] Bytes before corruption: %x", raw[macOffset-5:macOffset+5])
 	raw[macOffset] ^= 0xFF
@@ -197,7 +209,7 @@ func TestWinZipAES_CorruptedMAC(t *testing.T) {
 	if err != nil {
 		t.Fatalf("f.Open failed: %v", err)
 	}
-	defer rc.Close()
+	closeAt(t, rc)
 
 	decrypted, err := io.ReadAll(rc)
 	t.Logf("[DEBUG-TEST] ReadAll returned error: %v, decrypted len: %d", err, len(decrypted))
@@ -206,6 +218,7 @@ func TestWinZipAES_CorruptedMAC(t *testing.T) {
 	}
 }
 func TestWinZipAES_Writer_BufResizing(t *testing.T) {
+	// #nosec G101 -- not a credential: the literal the test encrypts a fixture archive with and then re-reads it with, so it has to be in the source
 	password := "buf-resize-pass"
 	buf := new(bytes.Buffer)
 
@@ -222,13 +235,15 @@ func TestWinZipAES_Writer_BufResizing(t *testing.T) {
 	}
 
 	// Write 1: 5 bytes
-	w.Write([]byte("12345"))
+	mustWrite(t, w, []byte("12345"))
 	// Write 2: 20 bytes (triggers buf resizing)
-	w.Write([]byte("abcde12345abcde12345"))
+	mustWrite(t, w, []byte("abcde12345abcde12345"))
 	// Write 3: 2 bytes (tests reusing larger buffer)
-	w.Write([]byte("xy"))
+	mustWrite(t, w, []byte("xy"))
 
-	zw.Close()
+	if err := zw.Close(); err != nil {
+		t.Fatalf("close writer: %v", err)
+	}
 
 	// Verify content is fully readable and decrypted correctly
 	zr, _ := NewReader(bytes.NewReader(buf.Bytes()), int64(buf.Len()))
@@ -237,7 +252,7 @@ func TestWinZipAES_Writer_BufResizing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
-	defer rc.Close()
+	closeAt(t, rc)
 
 	content, err := io.ReadAll(rc)
 	if err != nil {
@@ -264,8 +279,8 @@ func TestWinZipAES_Seekable(t *testing.T) {
 		Password:    password,
 		AESStrength: 3,
 	}
-	w1, _ := zw.CreateHeader(fh1)
-	w1.Write(data)
+	w1 := mustCreateHeader(t, zw, fh1)
+	mustWrite(t, w1, data)
 
 	// 2. Compressed (Deflate) with AES + Seek Index
 	fh2 := &FileHeader{
@@ -276,10 +291,12 @@ func TestWinZipAES_Seekable(t *testing.T) {
 		SeekChunkSize:  1024,
 		SeekContinuous: true,
 	}
-	w2, _ := zw.CreateHeader(fh2)
-	w2.Write(data)
+	w2 := mustCreateHeader(t, zw, fh2)
+	mustWrite(t, w2, data)
 
-	zw.Close()
+	if err := zw.Close(); err != nil {
+		t.Fatalf("close writer: %v", err)
+	}
 
 	zr, _ := NewReader(bytes.NewReader(buf.Bytes()), int64(buf.Len()))
 	zr.SetPassword(password)
@@ -292,9 +309,13 @@ func TestWinZipAES_Seekable(t *testing.T) {
 	}
 
 	// Seek to unaligned offset (17) which crosses the 16-byte block boundary
-	rs1.Seek(17, io.SeekStart)
+	if _, err := rs1.Seek(17, io.SeekStart); err != nil {
+		t.Fatalf("Store seek failed: %v", err)
+	}
 	out := make([]byte, 16)
-	io.ReadFull(rs1, out)
+	if _, err := io.ReadFull(rs1, out); err != nil {
+		t.Fatalf("Store read failed: %v", err)
+	}
 	if !bytes.Equal(out, data[17:33]) {
 		t.Errorf("Store seek mismatch:\ngot  %q\nwant %q", string(out), string(data[17:33]))
 	}
@@ -308,9 +329,13 @@ func TestWinZipAES_Seekable(t *testing.T) {
 
 	// Seek directly into the second chunk boundary where dictionary state is needed.
 	// The AES decrypter should automatically shift the IV to match the start of the compressed chunk!
-	rs2.Seek(2048, io.SeekStart)
+	if _, err := rs2.Seek(2048, io.SeekStart); err != nil {
+		t.Fatalf("Deflate seek failed: %v", err)
+	}
 	out2 := make([]byte, 16)
-	io.ReadFull(rs2, out2)
+	if _, err := io.ReadFull(rs2, out2); err != nil {
+		t.Fatalf("Deflate read failed: %v", err)
+	}
 	if !bytes.Equal(out2, data[2048:2064]) {
 		t.Errorf("Deflate seek mismatch:\ngot  %q\nwant %q", string(out2), string(data[2048:2064]))
 	}

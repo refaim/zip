@@ -22,6 +22,7 @@ type matchFinder struct {
 	prev [windowSize64]uint32
 
 	data       []byte
+	dataLen    uint32 // len(data), kept in the type the search arithmetic uses
 	pos        uint32
 	maxMatch   uint32
 	windowSize uint32
@@ -46,6 +47,10 @@ func newMatchFinder(isDeflate64 bool, depthCycles uint32) *matchFinder {
 
 func (mf *matchFinder) reset(data []byte) {
 	mf.data = data
+	// #nosec G115 -- the match finder is handed one in-memory deflate block at
+	// a time and the writer caps those at blockSizeLimit (65532) bytes, so the
+	// length is nowhere near the uint32 range.
+	mf.dataLen = uint32(len(data))
 	mf.pos = 0
 	// Fast clear of head and prev arrays
 	for i := range mf.head {
@@ -67,7 +72,7 @@ func hash3(v uint32) uint32 {
 func (mf *matchFinder) findMatches(dst []match) []match {
 	dst = dst[:0]
 
-	if mf.pos+minMatch >= uint32(len(mf.data)) {
+	if mf.pos+minMatch >= mf.dataLen {
 		mf.pos++ // Advance cursor even if EOF is reached
 		return dst
 	}
@@ -98,8 +103,8 @@ func (mf *matchFinder) findMatches(dst []match) []match {
 
 	bestLen := uint32(minMatch - 1)
 	limit := (mf.pos - 1) + mf.maxMatch
-	if limit > uint32(len(mf.data)) {
-		limit = uint32(len(mf.data))
+	if limit > mf.dataLen {
+		limit = mf.dataLen
 	}
 
 	avail := limit - (mf.pos - 1)
@@ -149,7 +154,7 @@ func (mf *matchFinder) findMatches(dst []match) []match {
 // skip advances the position by n bytes, updating hash chains
 // without searching for matches (used when consuming tokens in the LZ77 loop).
 func (mf *matchFinder) skip(n uint32) {
-	limit := uint32(len(mf.data)) - minMatch
+	limit := mf.dataLen - minMatch
 	for i := uint32(0); i < n; i++ {
 		if mf.pos < limit {
 			v := binary.LittleEndian.Uint32(mf.data[mf.pos:])

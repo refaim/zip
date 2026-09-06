@@ -103,7 +103,10 @@ var flateReaderPool sync.Pool
 func newFlateReader(r io.Reader) io.ReadCloser {
 	fr, ok := flateReaderPool.Get().(io.ReadCloser)
 	if ok {
-		fr.(flate.Resetter).Reset(r, nil)
+		// The flate decompressor's Reset only overwrites its own state
+		// and returns nil for every input; the error is part of the
+		// Resetter interface, not of anything that can go wrong here.
+		_ = fr.(flate.Resetter).Reset(r, nil)
 	} else {
 		fr = flate.NewReader(r)
 	}
@@ -171,7 +174,11 @@ func newZstdReader(r io.Reader) io.ReadCloser {
 		dec, _ = zstd.NewReader(nil, zstd.WithDecoderConcurrency(1), zstd.WithDecoderMaxWindow(512<<20), zstd.WithDecoderMaxMemory(512<<20))
 	}
 	if dec != nil {
-		dec.Reset(r)
+		// Reset only reports one thing, that the decoder has been
+		// closed, and this pool never closes one: pooledZstdReader.Close
+		// resets the decoder to no input and puts it back. A stream that
+		// is not zstd is found out on the first read of it, not here.
+		_ = dec.Reset(r)
 	}
 	return &pooledZstdReader{dec: dec}
 }

@@ -68,9 +68,15 @@ func (fp *FilePool) Get() *File {
 	return fp.files[idx]
 }
 
-func (fp *FilePool) Put(f *File) {
-	f.reset()
+// Put returns a file to the pool. The file is emptied first, and the error of
+// emptying it is the caller's to see: a file that could not be emptied still
+// holds the bytes of the entry that used it, and the disk it holds them on is
+// not going to free them by itself. The file goes back to the pool either way,
+// so a caller that keeps going is not deadlocked by one bad file.
+func (fp *FilePool) Put(f *File) error {
+	err := f.reset()
 	fp.limiter <- f.idx
+	return err
 }
 
 func (fp *FilePool) Close() error {
@@ -172,6 +178,7 @@ func (f *File) Read(p []byte) (n int, err error) {
 }
 
 func (f *File) Written() uint64 {
+	// #nosec G115 -- f.w starts at zero and only ever grows by the number of bytes a copy or a write reported, so it is never negative
 	return uint64(f.w)
 }
 
@@ -183,11 +190,12 @@ func (f *File) Checksum() uint32 {
 	return f.crc.Sum32()
 }
 
-func (f *File) reset() {
+func (f *File) reset() error {
 	f.w = 0
 	f.r = 0
 	f.crc.Reset()
 	if f.f != nil {
-		f.f.Truncate(0)
+		return f.f.Truncate(0)
 	}
+	return nil
 }

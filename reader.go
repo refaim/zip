@@ -4,10 +4,12 @@ import (
 	"bufio"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"hash"
 	"hash/crc32"
 	"io"
 	"io/fs"
+	"math"
 	"os"
 	"path"
 	"path/filepath"
@@ -15,7 +17,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"unicode/utf8"
 
 	"github.com/klauspost/compress/flate"
 	"github.com/unxed/zipcharset"
@@ -97,7 +98,12 @@ type Reader struct {
 }
 
 type ReadCloser struct {
-	f *os.File
+	// volumes holds the open file handles OpenReader took, independently of
+	// what ended up in Reader.r. The two are not the same thing: an archive
+	// with an F4 recovery footer or an XCrypt payload gets its reader
+	// replaced by a wrapper, and a wrapper has no way to close the files
+	// underneath it.
+	volumes *MultiVolumeReader
 	Reader
 }
 
@@ -115,28 +121,28 @@ func OpenReaderWithPassword(name string, password string) (*ReadCloser, error) {
 	if err != nil {
 		return nil, err
 	}
-	ra, size, err := checkF4Recovery(mvr, size)
-	if err != nil {
-		mvr.Close()
-		return nil, err
-	}
+	ra, size := checkF4Recovery(mvr, size)
 
 	raDec, sizeDec, err := checkXCryptZip(ra, size, password)
 	if err != nil {
-		mvr.Close()
+		// The volumes are being closed on the way out of a call that
+		// is already failing; the error being returned is the one the
+		// caller needs.
+		_ = mvr.Close()
 		return nil, err
 	}
 
 	zr := new(ReadCloser)
+	zr.volumes = mvr
 	if password != "" {
 		zr.SetPassword(password)
 	}
 	if err = zr.init(raDec, sizeDec); err != nil {
-		mvr.Close()
+		_ = mvr.Close()
 		return nil, err
 	}
 
-	zr.Reader.r = raDec
+	zr.r = raDec
 	return zr, nil
 }
 
@@ -148,12 +154,9 @@ func NewReaderWithPassword(r io.ReaderAt, size int64, password string) (*Reader,
 	if size < 0 {
 		return nil, errors.New("zip: size cannot be negative")
 	}
-	r, size, err := checkF4Recovery(r, size)
-	if err != nil {
-		return nil, err
-	}
+	r, size = checkF4Recovery(r, size)
 
-	r, size, err = checkXCryptZip(r, size, password)
+	r, size, err := checkXCryptZip(r, size, password)
 	if err != nil {
 		return nil, err
 	}
@@ -222,12 +225,23 @@ func (r *Reader) salvage(rdr io.ReaderAt, size int64) error {
 					}
 				}
 
-				r.File = append(r.File, f)
+				// Salvage builds entries from local headers, so the
+				// size invariant readDirectoryHeader holds the
+				// central directory to has to be applied here too:
+				// everything downstream hands these sizes to
+				// io.NewSectionReader, where one above MaxInt64
+				// arrives negative and removes the bound instead of
+				// setting it. Such an entry is skipped and the scan
+				// carries on looking for the next real header.
+				if f.CompressedSize64 <= math.MaxInt64 && f.UncompressedSize64 <= math.MaxInt64 {
+					r.File = append(r.File, f)
 
-				skip := fileHeaderLen + int64(nlen) + int64(elen) + int64(f.CompressedSize64)
-				if skip > 0 && off+skip < size {
-					off += skip
-					continue
+					// #nosec G115 -- both sizes are held to MaxInt64 by the check above, and the lengths are two-byte header fields
+					skip := fileHeaderLen + int64(nlen) + int64(elen) + int64(f.CompressedSize64)
+					if skip > 0 && off+skip < size {
+						off += skip
+						continue
+					}
 				}
 			}
 		}
@@ -248,11 +262,13 @@ func (r *Reader) init(rdr io.ReaderAt, size int64) error {
 	r.r = rdr
 	r.baseOffset = baseOffset
 
+	// #nosec G115 -- NewReaderWithPassword refuses a negative size, so this is the length of the archive
 	if end.directorySize < uint64(size) && (uint64(size)-end.directorySize)/30 >= end.directoryRecords {
 		r.File = make([]*File, 0, end.directoryRecords)
 	}
 	r.Comment = end.comment
 	rs := io.NewSectionReader(rdr, 0, size)
+	// #nosec G115 -- readDirectoryEnd rejects a directory offset above MaxInt64 and checks that baseOffset plus this one lands inside the archive
 	dirOff := r.baseOffset + int64(end.directoryOffset)
 	if _, err = rs.Seek(dirOff, io.SeekStart); err != nil {
 		return err
@@ -278,6 +294,7 @@ func (r *Reader) init(rdr io.ReaderAt, size int64) error {
 		}
 		// Skip the Archive Decryption Header (usually 12-24 bytes)
 		// In practice, SES is more complex, but we are laying the foundation for stream decryption.
+		// #nosec G115 -- readDirectoryEnd rejects a directory size above MaxInt64
 		rd, _, err = newWinZipAesReader(rs, r.password(), info, int64(end.directorySize))
 		if err != nil {
 			return err
@@ -298,6 +315,10 @@ func (r *Reader) init(rdr io.ReaderAt, size int64) error {
 		f.headerOffset += r.baseOffset
 		r.File = append(r.File, f)
 	}
+	// The end record counts its entries in two bytes, so only the low
+	// sixteen bits of what was read can be compared with it; archive/zip
+	// checks the count the same way.
+	// #nosec G115 -- see above: both sides are deliberately taken modulo 2^16
 	if uint16(len(r.File)) != uint16(end.directoryRecords) {
 		return err
 	}
@@ -334,10 +355,14 @@ func (r *Reader) SetPassword(password string) {
 }
 
 func (rc *ReadCloser) Close() error {
-	if mvr, ok := rc.Reader.r.(*MultiVolumeReader); ok {
-		return mvr.Close()
+	// ReadCloser is exported, so a caller can hold one that never opened
+	// anything -- a variable declared before the OpenReader that would have
+	// filled it in returned an error. Closing that is not a failure, it is
+	// nothing to do.
+	if rc.volumes == nil {
+		return nil
 	}
-	return rc.f.Close()
+	return rc.volumes.Close()
 }
 
 func (f *File) HeaderOffset() int64 {
@@ -367,6 +392,7 @@ func (f *File) Open() (io.ReadCloser, error) {
 		return nil, err
 	}
 
+	// #nosec G115 -- readDirectoryHeader and salvage both refuse an entry whose CompressedSize64 is above MaxInt64
 	size := int64(f.CompressedSize64)
 	encryptionOffset := int64(0)
 	var crypto *zipCrypto
@@ -431,6 +457,7 @@ func (f *File) Open() (io.ReadCloser, error) {
 		desr = io.NewSectionReader(f.zipr, f.headerOffset+bodyOffset+size, ddLen)
 	}
 	rc = &limitReadCloser{
+		// #nosec G115 -- readDirectoryHeader and salvage both refuse an entry whose UncompressedSize64 is above MaxInt64
 		Reader: io.LimitReader(rc, int64(f.UncompressedSize64)),
 		Closer: rc,
 	}
@@ -457,6 +484,7 @@ func (f *File) OpenRaw() (io.Reader, error) {
 	if err != nil {
 		return nil, err
 	}
+	// #nosec G115 -- readDirectoryHeader and salvage both refuse an entry whose CompressedSize64 is above MaxInt64
 	r := io.NewSectionReader(f.zipr, f.headerOffset+bodyOffset, int64(f.CompressedSize64))
 	return r, nil
 }
@@ -467,6 +495,7 @@ func (f *File) findHiddenIndex() (int, []byte, error) {
 		return 0, nil, err
 	}
 
+	// #nosec G115 -- readDirectoryHeader and salvage both refuse an entry whose CompressedSize64 is above MaxInt64
 	endOffset := f.headerOffset + bodyOffset + int64(f.CompressedSize64)
 	if f.hasDataDescriptor() {
 		if f.zip64 {
@@ -528,7 +557,13 @@ func (f *File) findHiddenIndex() (int, []byte, error) {
 	compSize64 := uint64(compSize)
 	if compSize == uint32max {
 		extraBuf := make([]byte, extraLen)
-		f.zipr.ReadAt(extraBuf, endOffset+fileHeaderLen+int64(filenameLen))
+		// The zip64 extra is where the real size of the index lives when
+		// the 32-bit field is saturated. A short or failed read used to
+		// leave the buffer holding zeros, and the size was then parsed
+		// out of them as if the archive had said so.
+		if _, err := f.zipr.ReadAt(extraBuf, endOffset+fileHeaderLen+int64(filenameLen)); err != nil {
+			return 0, nil, err
+		}
 		for eb := readBuf(extraBuf); len(eb) >= 4; {
 			tag := eb.uint16()
 			sz := int(eb.uint16())
@@ -541,9 +576,18 @@ func (f *File) findHiddenIndex() (int, []byte, error) {
 		}
 	}
 
+	// The size of the payload is the hidden entry's own to declare -- a
+	// uint32, or the whole range of a uint64 through its zip64 extra -- and
+	// the buffer for it used to be made from that declaration before a byte
+	// of the payload had been read. Reading through a section reader bounds
+	// the allocation by the bytes the archive actually holds; anything the
+	// index is then short of is caught where the payload is parsed.
+	if compSize64 > math.MaxInt64 {
+		return 0, nil, fmt.Errorf("zip: seek index declares %d bytes: %w", compSize64, ErrFormat)
+	}
 	dataOffset := endOffset + fileHeaderLen + int64(filenameLen) + int64(extraLen)
-	payload := make([]byte, compSize64)
-	if _, err := f.zipr.ReadAt(payload, dataOffset); err != nil {
+	payload, err := io.ReadAll(io.NewSectionReader(f.zipr, dataOffset, int64(compSize64)))
+	if err != nil {
 		return 0, nil, err
 	}
 
@@ -552,6 +596,13 @@ func (f *File) findHiddenIndex() (int, []byte, error) {
 
 // OpenSeekable returns a ReadSeeker for the file content.
 // It requires a Seek Index (Hidden SOZip or GZIDX) to be present in the archive for compressed files.
+//
+// For an AES-encrypted entry the bytes this returns are decrypted but not
+// authenticated: reading at an offset cannot check an authentication code
+// computed over the whole entry, so the AE-2 code that Open verifies is not
+// verified here, and AE-2 leaves the CRC zero as well. AES-CTR is malleable,
+// so a flipped bit in the archive is a flipped bit in what this hands back,
+// and nothing reports it. Use Open where the data has to be trusted.
 func (f *File) OpenSeekable() (io.ReadSeeker, error) {
 	actualMethod := f.Method
 	if f.Method == winzipAesExtraID && f.aesInfo != nil {
@@ -568,15 +619,19 @@ func (f *File) OpenSeekable() (io.ReadSeeker, error) {
 				return nil, errors.New("zip: file is encrypted but no password provided")
 			}
 			if f.Method == winzipAesExtraID || f.aesInfo != nil {
+				// #nosec G115 -- readDirectoryHeader and salvage both refuse an entry whose CompressedSize64 is above MaxInt64
 				rawSection := io.NewSectionReader(f.zipr, f.headerOffset+bodyOffset, int64(f.CompressedSize64))
+				// #nosec G115 -- readDirectoryHeader and salvage both refuse an entry whose CompressedSize64 is above MaxInt64
 				aesRA, err := newWinZipAesReaderAt(rawSection, f.zip.password(), f.aesInfo, int64(f.CompressedSize64))
 				if err != nil {
 					return nil, err
 				}
+				// #nosec G115 -- readDirectoryHeader and salvage both refuse an entry whose UncompressedSize64 is above MaxInt64
 				return io.NewSectionReader(aesRA, 0, int64(f.UncompressedSize64)), nil
 			}
 			return nil, errors.New("zip: random access not supported for classic ZipCrypto")
 		}
+		// #nosec G115 -- readDirectoryHeader and salvage both refuse an entry whose UncompressedSize64 is above MaxInt64
 		return io.NewSectionReader(f.zipr, f.headerOffset+bodyOffset, int64(f.UncompressedSize64)), nil
 	}
 
@@ -598,15 +653,30 @@ func (f *File) OpenSeekable() (io.ReadSeeker, error) {
 		if offsetSize != 8 {
 			return nil, errors.New("zip: unsupported SOZip offset size")
 		}
+		// The index is read out of a hidden entry nothing signs and nothing
+		// checksums, and every number in it is used as an offset into the
+		// entry it indexes. A chunk size of zero is the divisor the wanted
+		// offset is divided by when a chunk is looked up.
+		if chunkSize == 0 {
+			return nil, fmt.Errorf("zip: SOZip index chunk size is zero: %w", ErrFormat)
+		}
+
+		// The first offset is this parser's own zero rather than the
+		// archive's, so it is the rest that have to be true of the entry:
+		// inside it, and in the order the chunks are in.
+		index := []uint64{0}
+		prev := uint64(0)
+		for offsetData := payload[32:]; len(offsetData) >= 8; offsetData = offsetData[8:] {
+			off := binary.LittleEndian.Uint64(offsetData[:8])
+			if off > f.CompressedSize64 || off < prev {
+				return nil, fmt.Errorf("zip: SOZip index offset %d is outside the entry: %w", off, ErrFormat)
+			}
+			prev = off
+			index = append(index, off)
+		}
 
 		f.SeekChunkSize = chunkSize
-		f.SeekIndex = []uint64{0}
-
-		offsetData := payload[32:]
-		for len(offsetData) >= 8 {
-			f.SeekIndex = append(f.SeekIndex, binary.LittleEndian.Uint64(offsetData[:8]))
-			offsetData = offsetData[8:]
-		}
+		f.SeekIndex = index
 
 		return &solidReadSeeker{f: f}, nil
 	}
@@ -618,29 +688,47 @@ func (f *File) OpenSeekable() (io.ReadSeeker, error) {
 		chunkSize := binary.LittleEndian.Uint32(payload[23:27])
 		numPoints := binary.LittleEndian.Uint32(payload[31:35])
 
-		if 35+int(numPoints)*18 > len(payload) {
-			return nil, errors.New("zip: invalid GZIDX payload (too short for points)")
+		// How many points the payload can hold, rather than how long a
+		// payload the claimed count would need: the count is the archive's,
+		// and multiplying it by the size of a point wraps on a 32-bit build
+		// -- above 119304647 points the product comes out small enough to
+		// pass for a payload that holds nothing of the sort, and the loop
+		// below then reads past it. The length of the payload is known to
+		// be at least 35 by the check above.
+		// #nosec G115 -- the payload is at least 35 bytes by the check above, so the subtraction cannot go negative
+		if uint64(numPoints) > uint64(len(payload)-35)/18 {
+			return nil, fmt.Errorf("zip: invalid GZIDX payload (too short for %d points): %w", numPoints, ErrFormat)
+		}
+		if chunkSize == 0 {
+			return nil, fmt.Errorf("zip: GZIDX index chunk size is zero: %w", ErrFormat)
 		}
 
-		f.SeekChunkSize = chunkSize
-		f.GzidxPoints = make([]gzPoint, numPoints)
+		points := make([]gzPoint, numPoints)
 		offset := 35
 		for i := 0; i < int(numPoints); i++ {
-			f.GzidxPoints[i].compOffset = binary.LittleEndian.Uint64(payload[offset:])
-			f.GzidxPoints[i].uncompOffset = binary.LittleEndian.Uint64(payload[offset+8:])
-			f.GzidxPoints[i].bits = payload[offset+16]
-			f.GzidxPoints[i].hasData = payload[offset+17]
+			points[i].compOffset = binary.LittleEndian.Uint64(payload[offset:])
+			points[i].uncompOffset = binary.LittleEndian.Uint64(payload[offset+8:])
+			points[i].bits = payload[offset+16]
+			points[i].hasData = payload[offset+17]
+			// A point names a place in the entry on both sides of the
+			// decompressor, and both of them are read from as offsets.
+			if points[i].compOffset > f.CompressedSize64 || points[i].uncompOffset > f.UncompressedSize64 {
+				return nil, fmt.Errorf("zip: GZIDX point %d is outside the entry: %w", i, ErrFormat)
+			}
 			offset += 18
 		}
 		for i := 0; i < int(numPoints); i++ {
-			if f.GzidxPoints[i].hasData == 1 {
+			if points[i].hasData == 1 {
 				if offset+32768 > len(payload) {
 					return nil, errors.New("zip: invalid GZIDX payload (truncated window data)")
 				}
-				f.GzidxPoints[i].window = payload[offset : offset+32768]
+				points[i].window = payload[offset : offset+32768]
 				offset += 32768
 			}
 		}
+
+		f.SeekChunkSize = chunkSize
+		f.GzidxPoints = points
 		return &solidReadSeeker{f: f, isContinuous: true}, nil
 	}
 
@@ -662,13 +750,18 @@ func (s *solidReadSeeker) Seek(offset int64, whence int) (int64, error) {
 	case io.SeekCurrent:
 		newOff = s.off + offset
 	case io.SeekEnd:
+		// #nosec G115 -- readDirectoryHeader and salvage both refuse an entry whose UncompressedSize64 is above MaxInt64
 		newOff = int64(s.f.UncompressedSize64) + offset
 	}
+	// #nosec G115 -- readDirectoryHeader and salvage both refuse an entry whose UncompressedSize64 is above MaxInt64
 	if newOff < 0 || newOff > int64(s.f.UncompressedSize64) {
 		return 0, errors.New("zip: invalid seek offset")
 	}
 	if newOff != s.off && s.currRC != nil {
-		s.currRC.Close()
+		// The reader being dropped is a decompressor positioned at the
+		// old offset; the seek opens a new one, and nothing that was
+		// read through this one is still wanted.
+		_ = s.currRC.Close()
 		s.currRC = nil
 	}
 	s.off = newOff
@@ -676,6 +769,7 @@ func (s *solidReadSeeker) Seek(offset int64, whence int) (int64, error) {
 }
 
 func (s *solidReadSeeker) Read(p []byte) (int, error) {
+	// #nosec G115 -- readDirectoryHeader and salvage both refuse an entry whose UncompressedSize64 is above MaxInt64
 	if s.off >= int64(s.f.UncompressedSize64) {
 		return 0, io.EOF
 	}
@@ -688,6 +782,7 @@ func (s *solidReadSeeker) Read(p []byte) (int, error) {
 			var best *gzPoint
 			for i := range s.f.GzidxPoints {
 				pt := &s.f.GzidxPoints[i]
+				// #nosec G115 -- a GZIDX point is held to uncompOffset <= UncompressedSize64 <= MaxInt64 where the index is parsed
 				if int64(pt.uncompOffset) <= s.off {
 					if best == nil || pt.uncompOffset > best.uncompOffset {
 						best = pt
@@ -697,13 +792,16 @@ func (s *solidReadSeeker) Read(p []byte) (int, error) {
 			if best == nil {
 				return 0, io.EOF
 			}
+			// #nosec G115 -- a GZIDX point is held to compOffset <= CompressedSize64 <= MaxInt64 where the index is parsed
 			compOffset = int64(best.compOffset)
+			// #nosec G115 -- a GZIDX point is held to uncompOffset <= UncompressedSize64 <= MaxInt64 where the index is parsed
 			uncompOffset = int64(best.uncompOffset)
 		} else {
 			blockIdx := s.off / int64(s.f.SeekChunkSize)
 			if blockIdx >= int64(len(s.f.SeekIndex)) {
 				return 0, io.EOF
 			}
+			// #nosec G115 -- a SOZip index entry is held to <= CompressedSize64 <= MaxInt64 where the index is parsed
 			compOffset = int64(s.f.SeekIndex[blockIdx])
 			uncompOffset = blockIdx * int64(s.f.SeekChunkSize)
 		}
@@ -713,6 +811,7 @@ func (s *solidReadSeeker) Read(p []byte) (int, error) {
 			return 0, err
 		}
 
+		// #nosec G115 -- readDirectoryHeader and salvage both refuse an entry whose CompressedSize64 is above MaxInt64
 		totalCompSize := int64(s.f.CompressedSize64)
 
 		var section io.Reader
@@ -745,6 +844,7 @@ func (s *solidReadSeeker) Read(p []byte) (int, error) {
 		if s.isContinuous {
 			var best *gzPoint
 			for i := range s.f.GzidxPoints {
+				// #nosec G115 -- a GZIDX point is held to uncompOffset <= UncompressedSize64 <= MaxInt64 where the index is parsed
 				if int64(s.f.GzidxPoints[i].uncompOffset) == uncompOffset {
 					best = &s.f.GzidxPoints[i]
 					break
@@ -825,6 +925,7 @@ func (r *checksumReader) Read(b []byte) (n int, err error) {
 	}
 	n, err = r.rc.Read(b)
 	r.hash.Write(b[:n])
+	// #nosec G115 -- n is the byte count io.Reader.Read returned, which is never negative
 	r.nread += uint64(n)
 	if r.nread > r.f.UncompressedSize64 {
 		return 0, encryptedDataError(r.f, ErrFormat)
@@ -921,15 +1022,12 @@ func readDirectoryHeader(f *File, r io.Reader) error {
 	packOS := byte(f.CreatorVersion >> 8)
 	packVer := f.CreatorVersion & 0xFF
 
-	f.Name = zipcharset.DecodeText(rawName, isUTF8, packOS, packVer, f.Extra, false)
-	if !utf8.ValidString(f.Name) {
-		f.Name = decodeUTF8OrMap([]byte(f.Name))
-	}
+	// decodeUTF8OrMap makes the validity check itself and answers a valid
+	// string with itself, so repeating the check here would only give it a
+	// second spelling to disagree with.
+	f.Name = decodeUTF8OrMap([]byte(zipcharset.DecodeText(rawName, isUTF8, packOS, packVer, f.Extra, false)))
 	f.Name = strings.ReplaceAll(f.Name, "\\", "/")
-	f.Comment = zipcharset.DecodeText(rawComment, isUTF8, packOS, packVer, f.Extra, true)
-	if !utf8.ValidString(f.Comment) {
-		f.Comment = decodeUTF8OrMap([]byte(f.Comment))
-	}
+	f.Comment = decodeUTF8OrMap([]byte(zipcharset.DecodeText(rawComment, isUTF8, packOS, packVer, f.Extra, true)))
 
 	utf8Valid1, utf8Require1 := detectUTF8(f.Name)
 	utf8Valid2, utf8Require2 := detectUTF8(f.Comment)
@@ -978,6 +1076,7 @@ parseExtras:
 				if len(fieldBuf) < 8 {
 					return ErrFormat
 				}
+				// #nosec G115 -- an offset above MaxInt64 arrives negative and the entry is refused by the check at the end of this function
 				f.headerOffset = int64(fieldBuf.uint64())
 			}
 		case ntfsExtraID:
@@ -999,14 +1098,31 @@ parseExtras:
 				const ticksPerSecond = 1e7
 				epoch := time.Date(1601, time.January, 1, 0, 0, 0, 0, time.UTC).Unix()
 
-				parseNTFS := func(b *readBuf) time.Time {
-					t := int64(b.uint64())
-					return time.Unix(epoch+(t/ticksPerSecond), (t%ticksPerSecond)*100)
+				// A FILETIME counts 100-nanosecond ticks from 1601 and
+				// is unsigned. One that does not fit an int64 read as
+				// one anyway comes out negative, which puts the entry
+				// before 1601 -- a date the field cannot express and
+				// the archive did not mean. The eight bytes are still
+				// consumed, so the fields after it stay lined up; the
+				// time itself is left as it was.
+				parseNTFS := func(b *readBuf) (time.Time, bool) {
+					raw := b.uint64()
+					if raw > math.MaxInt64 {
+						return time.Time{}, false
+					}
+					t := int64(raw)
+					return time.Unix(epoch+(t/ticksPerSecond), (t%ticksPerSecond)*100), true
 				}
 
-				modified = parseNTFS(&attrBuf)
-				f.Accessed = parseNTFS(&attrBuf)
-				f.Created = parseNTFS(&attrBuf)
+				if v, ok := parseNTFS(&attrBuf); ok {
+					modified = v
+				}
+				if v, ok := parseNTFS(&attrBuf); ok {
+					f.Accessed = v
+				}
+				if v, ok := parseNTFS(&attrBuf); ok {
+					f.Created = v
+				}
 			}
 		case unixExtraID:
 			if len(fieldBuf) < 8 {
@@ -1023,7 +1139,14 @@ parseExtras:
 						f.Devmajor = int64(fieldBuf.uint32())
 						f.Devminor = int64(fieldBuf.uint32())
 					} else {
-						f.Linkname = string(fieldBuf)
+						// The same mapping Name and Comment go through.
+						// A link target is a name like any other and can
+						// be just as undecodable, and leaving it raw here
+						// left it the one archive-derived string with no
+						// mark to say so -- after which osFileName handed
+						// it straight back and the link was made to bytes
+						// no file had been written under.
+						f.Linkname = decodeUTF8OrMap(fieldBuf)
 					}
 				}
 			}
@@ -1111,6 +1234,16 @@ parseExtras:
 		return ErrFormat
 	}
 
+	// Both sizes and the offset of the local header leave this package as
+	// int64: Open, OpenRaw and OpenSeekable hand them to io.NewSectionReader
+	// and FileInfo returns a size. Above MaxInt64 each of them arrives
+	// negative there, and a section reader given a negative length reads
+	// without a bound from an offset the archive picked. An archive that
+	// large does not exist, so the entry is simply not a valid one.
+	if f.CompressedSize64 > math.MaxInt64 || f.UncompressedSize64 > math.MaxInt64 || f.headerOffset < 0 {
+		return ErrFormat
+	}
+
 	return nil
 }
 
@@ -1191,8 +1324,12 @@ func readDirectoryEnd(r io.ReaderAt, size int64) (dir *directoryEnd, baseOffset 
 	if d.directoryRecords == 0xffff || d.directorySize == 0xffff || d.directoryOffset == 0xffffffff {
 		p, err := findDirectory64End(r, directoryEndOffset)
 		if err == nil && p >= 0 {
+			// The locator sits between the record and the end record,
+			// so what is left between the record's first byte and the
+			// locator is all the room the record has.
+			room := max(directoryEndOffset-directory64LocLen-p-12, 0)
 			directoryEndOffset = p
-			err = readDirectory64End(r, p, d)
+			err = readDirectory64End(r, p, room, d)
 		}
 		if err != nil {
 			return nil, 0, err
@@ -1245,10 +1382,21 @@ func findDirectory64End(r io.ReaderAt, directoryEndOffset int64) (int64, error) 
 	if b.uint32() != 1 {
 		return -1, nil
 	}
-	return int64(p), nil
+	// A negative return is how this function says there is no zip64 end
+	// record to read, so an offset above MaxInt64 narrowed into one would
+	// quietly turn a record that is there into a record that is not.
+	off, err := u64toi64(p)
+	if err != nil {
+		return -1, err
+	}
+	return off, nil
 }
 
-func readDirectory64End(r io.ReaderAt, offset int64, d *directoryEnd) (err error) {
+// readDirectory64End reads the zip64 end record at offset. room is how many
+// bytes of record content the archive has room for: the locator that named the
+// record sits immediately after it, so the space between the two is the most
+// the record can hold, whatever the record says about itself.
+func readDirectory64End(r io.ReaderAt, offset, room int64, d *directoryEnd) (err error) {
 	// 1. Read the first 12 bytes to get the actual record size
 	var hbuf [12]byte
 	if _, err := r.ReadAt(hbuf[:], offset); err != nil {
@@ -1261,8 +1409,26 @@ func readDirectory64End(r io.ReaderAt, offset int64, d *directoryEnd) (err error
 	// recordSize is the size of the record minus the first 12 bytes (sig + size)
 	recordSize := hb.uint64()
 
-	// 2. Read the rest of the record
-	buf := make([]byte, recordSize)
+	// 2. Read the rest of the record, which is as much of it as is used and
+	// no more. The size of the record is eight bytes of the archive's own
+	// choosing, and the buffer for it used to be made from that number
+	// before a byte of the record had been read -- a quarter of the address
+	// space asked for this way is a panic, not an archive the reader
+	// rejects. What is read also has to be the record's own, which is what
+	// room is for: a record that claims to reach past where the locator
+	// says it ends has its version 2 fields read out of the locator and the
+	// end record instead, and the end record's signature carries the bit
+	// that says the central directory is encrypted -- so an archive that
+	// reads perfectly well announces that it cannot be read. A record too
+	// short for the fields below is not a record either, since readBuf
+	// reads them without looking at what is left.
+	const maxRecord = directory64EndLen - 12 + 24 // the fields below, plus the version 2 ones
+	// #nosec G115 -- room is what the caller measured between the record and the locator and is clamped to zero there
+	held := min(recordSize, uint64(room))
+	if held < directory64EndLen-12 {
+		return ErrFormat
+	}
+	buf := make([]byte, min(held, uint64(maxRecord)))
 	if _, err := r.ReadAt(buf, offset+12); err != nil {
 		return err
 	}
@@ -1376,7 +1542,7 @@ func (f *fileListEntry) ModTime() time.Time {
 	if f.file == nil {
 		return time.Time{}
 	}
-	return f.file.FileHeader.Modified.UTC()
+	return f.file.Modified.UTC()
 }
 
 func (f *fileListEntry) Info() (fs.FileInfo, error) { return f, nil }
