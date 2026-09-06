@@ -3,6 +3,7 @@ package zip
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -435,44 +436,22 @@ func TestDecompressor_Panics(t *testing.T) {
 	RegisterDecompressor(Deflate, nil)
 }
 
-func TestPPMd_HeaderParsing(t *testing.T) {
-	// Simulate 2 bytes of the PPMd header
-	// Order=8 (val 7), Mem=50MB (val 49)
-	// 7 + (49 << 4) = 7 + 784 = 791 (0x0317)
-	header := []byte{0x17, 0x03}
-
-	r := bytes.NewReader(header)
-	// newPPMdReader will attempt to initialize the library.
-	// Verify that there is no panic when reading properties.
-	rc := newPPMdReader(r, 1000)
-	// A nil reader is how newPPMdReader reports that it could not read the
-	// two property bytes. They are both there, so whatever it makes of them
-	// -- a decoder, or an errorReader saying why not -- it has to hand one
-	// back rather than treat the header as truncated.
+// TestPPMd_EntriesAreRefused: PPMd is a family of algorithms rather than one,
+// and the variant ZIP uses is not the variant a decoder is available for here,
+// so an entry compressed with it is turned away instead of being decoded into
+// bytes nobody wrote. Nothing about the entry changes that answer, and the
+// reason has to read as ErrAlgorithm, which is what a caller asks about when
+// it wants to know whether an archive can be read at all.
+func TestPPMd_EntriesAreRefused(t *testing.T) {
+	// The two bytes a real entry carries here would say order 8 and a 50 MB
+	// model. Nothing reads them any more.
+	rc := newPPMdReader(bytes.NewReader([]byte{0x17, 0x03}), 1000)
 	if rc == nil {
-		t.Fatal("newPPMdReader returned nil for a header it read in full")
+		t.Fatal("newPPMdReader handed back nothing at all")
 	}
 	closeAt(t, rc)
-}
-func TestPPMd_MemoryLimit(t *testing.T) {
-	// MemSize is bits 4-11 (+1) in MB.
-	// Set to 255 (which means 256MB).
-	// val = 0 | (255 << 4) = 4080 (0x0FF0)
-	header := []byte{0xF0, 0x0F}
-	r := bytes.NewReader(header)
-	rc := newPPMdReader(r, 1000)
-	if rc == nil {
-		t.Fatal("expected non-nil errorReader")
-	}
-	buf := make([]byte, 10)
-	_, err := rc.Read(buf)
-	// A build with no PPMd at all refuses the header outright, which is the
-	// same answer to the same question: the memory it asks for is not
-	// granted.
-	if err == nil ||
-		(!strings.Contains(err.Error(), "PPMd memory limit exceeded") &&
-			!strings.Contains(err.Error(), "PPMd compression is not supported")) {
-		t.Errorf("expected the PPMd memory request to be refused, got: %v", err)
+	if _, err := rc.Read(make([]byte, 10)); !errors.Is(err, ErrAlgorithm) {
+		t.Errorf("reading a PPMd entry gave %v, want it refused as an algorithm this package cannot read", err)
 	}
 }
 

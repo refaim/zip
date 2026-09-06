@@ -39,6 +39,12 @@ func fixOSPath(p string) string {
 // reaches the kernel at all.
 var getwd = os.Getwd
 
+// mkdir is os.Mkdir behind a name a test can take over. Making a directory
+// where a file has just been taken away fails only if the filesystem has run
+// out of room or somebody put something back in the moment between the two
+// calls, and no test can arrange either portably.
+var mkdir = os.Mkdir
+
 // absKeepTrailing is filepath.Abs with the Win32 path normalisation left out,
 // and reports whether it had an answer.
 //

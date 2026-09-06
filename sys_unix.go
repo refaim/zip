@@ -64,6 +64,15 @@ var (
 	resolveMut sync.RWMutex
 )
 
+// lookupUserByName and lookupGroupByName are the account database behind names
+// a test can take over. Everything it answers with is text, the id included,
+// and an id that is not a number is a database these lookups have no number to
+// hand back from.
+var (
+	lookupUserByName  = user.Lookup
+	lookupGroupByName = user.LookupGroup
+)
+
 func lookupUser(name string) (int, error) {
 	resolveMut.RLock()
 	id, ok := uidCache[name]
@@ -72,7 +81,7 @@ func lookupUser(name string) (int, error) {
 		return id, nil
 	}
 
-	u, err := user.Lookup(name)
+	u, err := lookupUserByName(name)
 	if err != nil {
 		return -1, err
 	}
@@ -95,7 +104,7 @@ func lookupGroup(name string) (int, error) {
 		return id, nil
 	}
 
-	g, err := user.LookupGroup(name)
+	g, err := lookupGroupByName(name)
 	if err != nil {
 		return -1, err
 	}

@@ -258,10 +258,11 @@ func newZstdWriterLevel(w io.Writer, level int) (io.WriteCloser, error) {
 	pool := getZstdWriterPool(level)
 	enc, _ := pool.Get().(*zstd.Encoder)
 	if enc == nil {
+		// NewWriter reports an error only from an option it was given, and
+		// neither of these two can produce one: EncoderLevelFromZstd maps
+		// every int onto one of the four defined levels, and the CRC option
+		// only sets a flag. The encoder that comes back is never nil.
 		enc, _ = zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.EncoderLevelFromZstd(level)), zstd.WithEncoderCRC(false))
-	}
-	if enc == nil {
-		return nil, errors.New("zip: zstd encoder initialization failed")
 	}
 	enc.Reset(w)
 	return &pooledZstdWriter{enc: enc, w: w, pool: pool}, nil
@@ -297,6 +298,16 @@ func init() {
 // allowed for PPMd and LZMA decompilers to prevent RAM bomb DoS attacks.
 // Defaults to 128 MB.
 var MaxDecompressionDictSize int64 = 128 << 20
+
+// errPPMdVariant is what a PPMd entry is answered with. PPMd comes in
+// variants that are not compatible with one another: APPNOTE 5.10 gives ZIP
+// method 98 as variant I revision 1, while the decoder available to this
+// package implements variant H, the one .7z uses. No parameter makes the one
+// read the other's stream, so such an entry is refused at once rather than
+// decoded into bytes that were never written.
+var errPPMdVariant = fmt.Errorf(
+	"zip: PPMd entries are compressed with PPMd variant I (APPNOTE 5.10) and the decoder here reads variant H: %w",
+	ErrAlgorithm)
 
 type errorReader struct{ err error }
 

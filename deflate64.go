@@ -45,7 +45,7 @@ func (dr *deflate64Reader) Read(p []byte) (int, error) {
 			copied := dr.im.output.copyTo(p[bytesWritten:])
 			bytesWritten += copied
 			if bytesWritten == len(p) {
-				return bytesWritten, nil
+				break
 			}
 		}
 
@@ -95,8 +95,6 @@ func (dr *deflate64Reader) Read(p []byte) (int, error) {
 			}
 			if err == errDataError {
 				dr.im.state = stateDataErrored
-				dr.err = errDataError
-				return bytesWritten, errDataError
 			}
 			dr.err = err
 			return bytesWritten, err
@@ -379,11 +377,15 @@ func (ow *outputWindow) copyTo(output []byte) int {
 
 // Huffman Tree Constants and structures
 const (
-	symbolBits                     = 9
-	symbolMask                     = (1 << symbolBits) - 1 // 0x1FF
-	maxCodeLengths                 = 288
-	tableBits                      = 9
-	tableBitsMask                  = (1 << tableBits) - 1
+	symbolBits     = 9
+	symbolMask     = (1 << symbolBits) - 1 // 0x1FF
+	maxCodeLengths = 288
+	tableBits      = 9
+	tableBitsMask  = (1 << tableBits) - 1
+	// The longest word a block header can spell. The code length alphabet
+	// runs to 15, and 16, 17 and 18 are repeat instructions rather than
+	// lengths, so nothing longer than this ever reaches a tree.
+	maxBits                        = 15
 	maxLiteralTreeElements         = 288
 	maxDistTreeElements            = 32
 	endOfBlockCode                 = 256
@@ -401,8 +403,18 @@ func unpack(entry int16) (uint16, int32) {
 type huffmanTree struct {
 	codeLengthsLength uint16
 	table             [1 << tableBits]int16
-	nodes             [maxCodeLengths * 4]int16
-	codeLengthArray   [maxCodeLengths]byte
+	// A word longer than the direct table walks the levels below it, taking
+	// a pair of slots the first time it meets one nobody has taken yet. At
+	// most maxCodeLengths words walk at most maxBits-tableBits levels each,
+	// so at most that many pairs are ever taken, whatever length table the
+	// archive presented -- the count holds for a table that is incomplete or
+	// over-subscribed just as it does for a well formed one, because it
+	// counts the walking rather than the shape of the code. The pair numbers
+	// start at one, hence the extra pair. Six kilobytes and change per tree,
+	// three trees to a stream, and the highest slot number is nowhere near
+	// what the int16 the walk counts pairs in can hold.
+	nodes           [(maxCodeLengths*(maxBits-tableBits) + 1) * 2]int16
+	codeLengthArray [maxCodeLengths]byte
 }
 
 func newHuffmanTreeInvalid() *huffmanTree {
@@ -504,11 +516,10 @@ func (ht *huffmanTree) createTable() error {
 			start := int(codeArray[ch])
 
 			if lenVal <= tableBits {
+				// start is a code of lenVal bits reversed, so it is below
+				// 1<<lenVal however over-subscribed the table is, and the
+				// writes below stay inside the 1<<tableBits entries.
 				increment := 1 << lenVal
-				if start >= increment {
-					return errDataError
-				}
-
 				locs := 1 << (tableBits - lenVal)
 				for i := 0; i < locs; i++ {
 					ht.table[start] = pack(int16(ch), lenVal)
@@ -537,10 +548,8 @@ func (ht *huffmanTree) createTable() error {
 						bitSet = 1
 					}
 					index = leftChild + bitSet
-
-					if index >= len(ht.nodes) {
-						return errDataError
-					}
+					// nodes is sized for every pair this walk can take; see
+					// the field.
 					value = &ht.nodes[index]
 
 					codeBitMask <<= 1
@@ -566,6 +575,8 @@ func (ht *huffmanTree) getNextSymbol(input *inputBuffer) (uint16, error) {
 	entry := ht.table[bitBuffer&tableBitsMask]
 	bits := bitBuffer >> tableBits
 	for entry < 0 {
+		// A negative entry is a pair number createTable wrote, so the slot
+		// it names is one createTable already took.
 		childIndex := int(-entry) + int(bits&1)
 		entry = ht.nodes[childIndex]
 		bits >>= 1
@@ -589,6 +600,8 @@ func (ht *huffmanTree) getNextSymbolAssumeInput(input *inputBuffer) (uint16, err
 	entry := ht.table[bitBuffer&tableBitsMask]
 	bits := bitBuffer >> tableBits
 	for entry < 0 {
+		// A negative entry is a pair number createTable wrote, so the slot
+		// it names is one createTable already took.
 		childIndex := int(-entry) + int(bits&1)
 		entry = ht.nodes[childIndex]
 		bits >>= 1
@@ -656,7 +669,6 @@ type inflaterManaged struct {
 	lengthCode               uint16
 	codeList                 [maxLiteralTreeElements + maxDistTreeElements]byte
 	codeLengthTreeCodeLength [numberOfCodeLengthTreeElements]byte
-	deflate64                bool
 	codeLengthTree           *huffmanTree
 }
 
@@ -668,7 +680,6 @@ func newInflaterManaged() *inflaterManaged {
 		distanceTree:      newHuffmanTreeInvalid(),
 		codeLengthTree:    newHuffmanTreeInvalid(),
 		state:             stateReadingBFinal,
-		deflate64:         true,
 	}
 }
 
@@ -829,12 +840,13 @@ func (im *inflaterManaged) decodeBlock(input *inputBuffer, endOfBlockCodeSeen *b
 				im.state = stateReadingBFinal
 				return nil
 			} else {
+				// Deflate64 differs from Deflate in its last length code:
+				// 285 carries 16 extra bits instead of none. So every code
+				// past the eight that spell their length outright takes the
+				// extra bits extraLengthBits gives it.
 				symbol -= 257
 				if symbol < 8 {
 					symbol += 3
-					im.extraBits = 0
-				} else if !im.deflate64 && symbol == 28 {
-					symbol = 258
 					im.extraBits = 0
 				} else {
 					if int(symbol) >= len(extraLengthBits) {
@@ -891,10 +903,11 @@ func (im *inflaterManaged) decodeBlock(input *inputBuffer, endOfBlockCodeSeen *b
 				offset = int(im.distanceCode + 1)
 			}
 
-			if im.length > tableLookupLengthMax || offset > tableLookupDistanceMax {
-				return errDataError
-			}
-
+			// The longest length Deflate64 can spell is lengthBase[28] plus the
+			// 16 extra bits of code 285, which is tableLookupLengthMax, and the
+			// farthest distance is distanceBasePosition[31] plus its 14 extra
+			// bits, which is tableLookupDistanceMax. Both fit the window, and
+			// the loop above only runs while that much of it is free.
 			im.output.writeLengthDistance(im.length, offset)
 			freeBytes -= im.length
 			im.state = stateDecodeTop
@@ -961,9 +974,10 @@ func (im *inflaterManaged) decodeBlockFastInnerLoop(input *inputBuffer) (int, bo
 				offset = int(distanceBasePosition[distanceCode]) + int(bits)
 			}
 
-			if length > tableLookupLengthMax || offset > tableLookupDistanceMax {
-				return 0, false, errDataError
-			}
+			// Same bounds as the slow loop: a length code tops out at
+			// tableLookupLengthMax and a distance code at
+			// tableLookupDistanceMax, and this loop only runs while the window
+			// has that much room left.
 			im.output.writeLengthDistance(length, offset)
 		default:
 			return 0, false, errDataError
@@ -1016,10 +1030,10 @@ loop:
 				im.codeLengthTreeCodeLength[codeOder] = 0
 			}
 
-			err := im.codeLengthTree.newInPlace(im.codeLengthTreeCodeLength[:])
-			if err != nil {
-				return err
-			}
+			// Every code length here comes from a 3 bit field, so no code can
+			// be longer than the direct lookup table, which is the only way
+			// newInPlace reports a table it cannot build.
+			_ = im.codeLengthTree.newInPlace(im.codeLengthTreeCodeLength[:])
 			im.codeArraySize = im.literalLengthCodeCount + im.distanceCodeCount
 			im.loopCounter = 0
 

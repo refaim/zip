@@ -38,9 +38,11 @@ jobs:
       fail-fast: false
       matrix:
         # Runtime coverage is deliberately narrower than the platform reach of
-        # the package. Every other GOOS lives in the build matrix below, which
-        # compiles the platform files (fs_*.go, sys_*.go, register_ppmd*.go)
-        # and vets them without running them.
+        # the package. FreeBSD is run as well, in the virtual machine the job
+        # right below boots, because no hosted runner offers it. Every GOOS
+        # beyond those lives in the build matrix further down, which compiles
+        # the platform files (fs_*.go, sys_*.go) and vets them without running
+        # them.
         #
         # linux/386 is the one cell that is not the runner's own architecture.
         # It runs there because a 32-bit int is a different int: the package
@@ -52,12 +54,12 @@ jobs:
         # arithmetic is. The binaries are static and pure Go, so an amd64
         # runner executes them as they are.
         include:
-          - { os: ubuntu-latest,    target: linux/amd64,   goarch: amd64 }
-          - { os: ubuntu-latest,    target: linux/386,     goarch: "386" }
-          - { os: ubuntu-24.04-arm, target: linux/arm64,   goarch: arm64 }
-          - { os: windows-latest,   target: windows/amd64, goarch: amd64 }
-          - { os: macos-latest,     target: darwin/arm64,  goarch: arm64 }
-          - { os: macos-15-intel,   target: darwin/amd64,  goarch: amd64 }
+          - { os: ubuntu-latest,    target: linux/amd64,   goos: linux,   goarch: amd64 }
+          - { os: ubuntu-latest,    target: linux/386,     goos: linux,   goarch: "386" }
+          - { os: ubuntu-24.04-arm, target: linux/arm64,   goos: linux,   goarch: arm64 }
+          - { os: windows-latest,   target: windows/amd64, goos: windows, goarch: amd64 }
+          - { os: macos-latest,     target: darwin/arm64,  goos: darwin,  goarch: arm64 }
+          - { os: macos-15-intel,   target: darwin/amd64,  goos: darwin,  goarch: amd64 }
     env:
       # The package is pure Go. Pinning this keeps every runner on the same
       # configuration instead of letting each one decide by whether it happens
@@ -80,8 +82,178 @@ jobs:
       # already bitten: order independence is a property of the suite. The
       # seed is printed as `-test.shuffle N`, so any failure here reproduces
       # locally with -shuffle=N.
+      # The run is instrumented, and every test binary writes its own counter
+      # and meta files into one directory. That is the raw form the toolchain
+      # merges across platforms; a textual profile per cell could not be
+      # merged, because each cell compiles a different set of files.
       - name: Test
-        run: go test -count=1 -shuffle=on -timeout 10m ./...
+        run: |
+          mkdir -p "$RUNNER_TEMP/covdata"
+          go test -count=1 -shuffle=on -timeout 10m \
+            -cover -coverpkg=./... ./... \
+            -args -test.gocoverdir="$RUNNER_TEMP/covdata"
+
+      - name: Upload coverage data
+        uses: actions/upload-artifact@v4
+        with:
+          name: covdata-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: ${{ runner.temp }}/covdata
+          retention-days: 1
+          if-no-files-found: error
+
+  # A seventh test cell, split out only because it cannot share the matrix
+  # above: GitHub hosts no FreeBSD runner, so this one boots a FreeBSD guest
+  # under QEMU on an Ubuntu runner and runs the suite inside it. Everything
+  # else about it is the same -- the same flags, the same counter data, the
+  # same artifact -- and the coverage job treats it as an equal: sys_freebsd.go
+  # is measured here or it is not measured at all.
+  test-freebsd:
+    name: Test (freebsd/amd64)
+    runs-on: ubuntu-latest
+    # The guest boots, fetches a toolchain and finishes the suite in about a
+    # minute. The bound is wide because the go test -timeout below covers only
+    # the suite: a stall in the boot or in the download is outside it.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      # The action and the release are pinned for the reason the Go version is
+      # pinned everywhere else here: a cell that quietly changes what it runs
+      # stops reporting on the same thing twice.
+      #
+      # The toolchain is fetched rather than installed from packages, because
+      # pkg would supply whatever version the release happens to carry, and
+      # this cell has to be on the same Go as the six above it. The guest
+      # shares the workspace, so the counter files the suite writes are on the
+      # runner's own disk by the time this step returns.
+      - name: Test
+        uses: vmactions/freebsd-vm@v1.5.5
+        with:
+          release: '14'
+          usesh: true
+          prepare: |
+            fetch -o /tmp/go.tar.gz https://go.dev/dl/go1.25.14.freebsd-amd64.tar.gz
+            tar -C /usr/local -xzf /tmp/go.tar.gz
+          run: |
+            export PATH=/usr/local/go/bin:$PATH
+            export CGO_ENABLED=0
+            mkdir -p covdata
+            go test -count=1 -shuffle=on -timeout 10m \
+              -cover -coverpkg=./... ./... \
+              -args -test.gocoverdir="$(pwd)/covdata"
+
+      - name: Upload coverage data
+        uses: actions/upload-artifact@v4
+        with:
+          name: covdata-freebsd-amd64
+          path: covdata
+          retention-days: 1
+          if-no-files-found: error
+
+  coverage:
+    name: Coverage
+    needs: [test, test-freebsd]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      CGO_ENABLED: 0
+      # The one file no cell builds: sys_other.go is the fallback for the
+      # platforms the linux, freebsd, darwin and windows files leave unclaimed,
+      # so nothing that runs anywhere in this workflow compiles it. It is
+      # named rather than skipped by pattern: the check below demands that
+      # every other file in the module appears in the merged profile, so a
+      # file that quietly stops being built by any cell -- or a new
+      # platform-only file -- fails this job until someone puts it on this
+      # list on purpose. sys_freebsd.go was on it until the FreeBSD cell
+      # started running, and taking it off is what makes that cell load
+      # bearing: drop the cell and this job fails.
+      UNBUILT: sys_other.go
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: covdata-*
+          path: covdata
+
+      # One cell compiles fs_windows.go, another fs_unix.go, a third
+      # sys_darwin.go, a fourth sys_freebsd.go, and all seven compile
+      # reader.go. Merging the raw counter data is what unifies those into a
+      # single profile in which a block is covered if any cell reached it.
+      - name: Merge coverage data
+        run: |
+          dirs=$(printf '%s,' covdata/*/)
+          mkdir -p merged
+          go tool covdata merge -i="${dirs%,}" -o=merged
+          go tool covdata textfmt -i=merged -o=merged.txt
+
+      # A file with no statements at all is invisible to coverage, so the
+      # expectation is stated over the files that declare a function.
+      - name: Check every built file is measured
+        run: |
+          module=$(go list -m)
+          git ls-files '*.go' | grep -v '_test\.go$' | xargs grep -l '^func ' \
+            | sort > want.txt
+          for f in $UNBUILT; do echo "$f"; done | sort > unbuilt.txt
+          comm -23 want.txt unbuilt.txt > expected.txt
+          sed -n '2,$p' merged.txt | cut -d: -f1 | sed "s|^$module/||" \
+            | sort -u > measured.txt
+          missing=$(comm -23 expected.txt measured.txt)
+          extra=$(comm -13 expected.txt measured.txt)
+          if [ -n "$missing" ]; then
+            echo "Built by no test cell, and not on the UNBUILT list:"
+            echo "$missing"
+          fi
+          if [ -n "$extra" ]; then
+            echo "Measured although listed as unbuilt:"
+            echo "$extra"
+          fi
+          if [ -n "$missing$extra" ]; then
+            echo "::error::the set of measured files does not match the module"
+            exit 1
+          fi
+
+      # The merge already unifies a block that several cells compiled, but the
+      # sum is what the report is built from either way, and it is what keeps
+      # this honest if a future toolchain emits the same block once per build.
+      - name: Require every statement covered
+        run: |
+          module=$(go list -m)
+          awk 'NR > 1 { s[$1] = $2; c[$1] += $3 }
+               END { for (k in s) { t += s[k]; if (c[k] > 0) cv += s[k] }
+                     printf "%d %d\n", cv, t }' merged.txt > totals.txt
+          awk 'NR > 1 { s[$1] = $2; c[$1] += $3 }
+               END { for (k in s) if (c[k] == 0) print k }' merged.txt \
+            | sort > uncovered.txt
+          read -r covered total < totals.txt
+          echo "covered $covered of $total statements in $(wc -l < uncovered.txt) uncovered blocks"
+          if [ ! -s uncovered.txt ]; then
+            echo "::notice::every statement the test cells compile is covered"
+            exit 0
+          fi
+          while read -r block; do
+            file=${block%%:*}
+            span=${block#*:}
+            first=${span%%.*}
+            last=${span#*,}
+            last=${last%%.*}
+            path=${file#"$module/"}
+            echo "::group::$path:$first-$last"
+            sed -n "$first,${last}p" "$path"
+            echo "::endgroup::"
+          done < uncovered.txt
+          echo "::group::coverage by function"
+          go tool covdata func -i=merged
+          echo "::endgroup::"
+          echo "::error::$((total - covered)) uncovered statements"
+          exit 1
 
   race:
     name: Race
@@ -139,14 +311,11 @@ jobs:
         # and darwin because sys_darwin.go and its half of sys_unix.go are
         # compiled by neither of the other two.
         #
-        # freebsd is deliberately absent. Its own file would be analysed here
-        # readily enough, but nothing in this workflow runs on FreeBSD, so a
-        # line changed there could never be shown to be covered by a test --
-        # and the rule this repository holds itself to is that a touched line
-        # is a tested line. Its three findings are therefore left standing and
-        # written down rather than silenced; adding a FreeBSD runner is what
-        # would let them be closed honestly.
-        goos: [linux, windows, darwin]
+        # freebsd is here for sys_freebsd.go. The test job does run that file,
+        # in a virtual machine, but a linter reads source rather than a
+        # running system, so this cell needs no machine of its own and costs
+        # only its minute.
+        goos: [linux, windows, darwin, freebsd]
     env:
       CGO_ENABLED: 0
       # Named at the job rather than passed as an argument: the action runs
@@ -213,10 +382,9 @@ jobs:
         # are absent on purpose: fs_unix.go reaches for Fchmodat and
         # AT_SYMLINK_NOFOLLOW, which x/sys/unix does not define there.
         #
-        # The architecture spread is not decoration. register_ppmd.go builds
-        # only on amd64, arm64, s390x, ppc64le and riscv64 while
-        # register_ppmd_stub.go takes over elsewhere, and the Linux device
-        # metadata code is written twice, once per dev_t width.
+        # The architecture spread is not decoration: the Linux device metadata
+        # code is written twice, once per dev_t width, so a target of each
+        # width has to be compiled for either half to be looked at.
         #
         # The pairs are batched three ways rather than run one job apiece.
         # Compiling this package for one target takes seven to ten seconds

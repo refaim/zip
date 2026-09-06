@@ -545,6 +545,14 @@ func (w *Writer) CreateHeader(fh *FileHeader) (io.Writer, error) {
 			fh.UncompressedSize = 0
 			fh.UncompressedSize64 = 0
 
+			// A directory is an entry like any other and the record
+			// written for it in the central directory says where its
+			// local header is. Without one that offset lands on
+			// whatever follows -- the next entry's header, or the
+			// central directory itself for a directory written last.
+			if err := writeHeader(w.cw, h); err != nil {
+				return nil, err
+			}
 			ow = dirWriter{}
 		}
 	} else {

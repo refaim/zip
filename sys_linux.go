@@ -71,13 +71,19 @@ func extractSpecialFile(path string, hdr *FileHeader) error {
 	return mknod(path, mode, dev)
 }
 
+// llistxattr is unix.Llistxattr behind a name a test can take over. The names
+// have to be asked for twice, once for their length and once for themselves,
+// and the second answer failing after the first succeeded is a state only
+// something changing the file's attributes between the two calls produces.
+var llistxattr = unix.Llistxattr
+
 func sysXattrs(path string, hdr *FileHeader) error {
-	sz, err := unix.Llistxattr(path, nil)
+	sz, err := llistxattr(path, nil)
 	if err != nil || sz <= 0 {
 		return nil
 	}
 	buf := make([]byte, sz)
-	sz, err = unix.Llistxattr(path, buf)
+	sz, err = llistxattr(path, buf)
 	if err != nil {
 		return nil
 	}

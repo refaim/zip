@@ -267,12 +267,13 @@ func (r *Reader) init(rdr io.ReaderAt, size int64) error {
 		r.File = make([]*File, 0, end.directoryRecords)
 	}
 	r.Comment = end.comment
-	rs := io.NewSectionReader(rdr, 0, size)
 	// #nosec G115 -- readDirectoryEnd rejects a directory offset above MaxInt64 and checks that baseOffset plus this one lands inside the archive
 	dirOff := r.baseOffset + int64(end.directoryOffset)
-	if _, err = rs.Seek(dirOff, io.SeekStart); err != nil {
-		return err
-	}
+	// The directory runs from dirOff to the end of the archive. A reader over
+	// exactly that range says what seeking a reader over the whole file to the
+	// same place said, and the offset has already been checked to be inside
+	// the archive by the function that produced it.
+	rs := io.NewSectionReader(rdr, dirOff, size-dirOff)
 
 	var rd io.Reader = rs
 	if end.encrypted {
@@ -681,58 +682,56 @@ func (f *File) OpenSeekable() (io.ReadSeeker, error) {
 		return &solidReadSeeker{f: f}, nil
 	}
 
-	if idxType == 2 { // GZIDX
-		if len(payload) < 35 || string(payload[:5]) != "GZIDX" {
-			return nil, errors.New("zip: invalid GZIDX payload")
-		}
-		chunkSize := binary.LittleEndian.Uint32(payload[23:27])
-		numPoints := binary.LittleEndian.Uint32(payload[31:35])
+	// findHiddenIndex answers with 0, 1 or 2, and the first two are handled
+	// above, so what is left is GZIDX.
+	if len(payload) < 35 || string(payload[:5]) != "GZIDX" {
+		return nil, errors.New("zip: invalid GZIDX payload")
+	}
+	chunkSize := binary.LittleEndian.Uint32(payload[23:27])
+	numPoints := binary.LittleEndian.Uint32(payload[31:35])
 
-		// How many points the payload can hold, rather than how long a
-		// payload the claimed count would need: the count is the archive's,
-		// and multiplying it by the size of a point wraps on a 32-bit build
-		// -- above 119304647 points the product comes out small enough to
-		// pass for a payload that holds nothing of the sort, and the loop
-		// below then reads past it. The length of the payload is known to
-		// be at least 35 by the check above.
-		// #nosec G115 -- the payload is at least 35 bytes by the check above, so the subtraction cannot go negative
-		if uint64(numPoints) > uint64(len(payload)-35)/18 {
-			return nil, fmt.Errorf("zip: invalid GZIDX payload (too short for %d points): %w", numPoints, ErrFormat)
-		}
-		if chunkSize == 0 {
-			return nil, fmt.Errorf("zip: GZIDX index chunk size is zero: %w", ErrFormat)
-		}
-
-		points := make([]gzPoint, numPoints)
-		offset := 35
-		for i := 0; i < int(numPoints); i++ {
-			points[i].compOffset = binary.LittleEndian.Uint64(payload[offset:])
-			points[i].uncompOffset = binary.LittleEndian.Uint64(payload[offset+8:])
-			points[i].bits = payload[offset+16]
-			points[i].hasData = payload[offset+17]
-			// A point names a place in the entry on both sides of the
-			// decompressor, and both of them are read from as offsets.
-			if points[i].compOffset > f.CompressedSize64 || points[i].uncompOffset > f.UncompressedSize64 {
-				return nil, fmt.Errorf("zip: GZIDX point %d is outside the entry: %w", i, ErrFormat)
-			}
-			offset += 18
-		}
-		for i := 0; i < int(numPoints); i++ {
-			if points[i].hasData == 1 {
-				if offset+32768 > len(payload) {
-					return nil, errors.New("zip: invalid GZIDX payload (truncated window data)")
-				}
-				points[i].window = payload[offset : offset+32768]
-				offset += 32768
-			}
-		}
-
-		f.SeekChunkSize = chunkSize
-		f.GzidxPoints = points
-		return &solidReadSeeker{f: f, isContinuous: true}, nil
+	// How many points the payload can hold, rather than how long a
+	// payload the claimed count would need: the count is the archive's,
+	// and multiplying it by the size of a point wraps on a 32-bit build
+	// -- above 119304647 points the product comes out small enough to
+	// pass for a payload that holds nothing of the sort, and the loop
+	// below then reads past it. The length of the payload is known to
+	// be at least 35 by the check above.
+	// #nosec G115 -- the payload is at least 35 bytes by the check above, so the subtraction cannot go negative
+	if uint64(numPoints) > uint64(len(payload)-35)/18 {
+		return nil, fmt.Errorf("zip: invalid GZIDX payload (too short for %d points): %w", numPoints, ErrFormat)
+	}
+	if chunkSize == 0 {
+		return nil, fmt.Errorf("zip: GZIDX index chunk size is zero: %w", ErrFormat)
 	}
 
-	return nil, errors.New("zip: seek index missing")
+	points := make([]gzPoint, numPoints)
+	offset := 35
+	for i := 0; i < int(numPoints); i++ {
+		points[i].compOffset = binary.LittleEndian.Uint64(payload[offset:])
+		points[i].uncompOffset = binary.LittleEndian.Uint64(payload[offset+8:])
+		points[i].bits = payload[offset+16]
+		points[i].hasData = payload[offset+17]
+		// A point names a place in the entry on both sides of the
+		// decompressor, and both of them are read from as offsets.
+		if points[i].compOffset > f.CompressedSize64 || points[i].uncompOffset > f.UncompressedSize64 {
+			return nil, fmt.Errorf("zip: GZIDX point %d is outside the entry: %w", i, ErrFormat)
+		}
+		offset += 18
+	}
+	for i := 0; i < int(numPoints); i++ {
+		if points[i].hasData == 1 {
+			if offset+32768 > len(payload) {
+				return nil, errors.New("zip: invalid GZIDX payload (truncated window data)")
+			}
+			points[i].window = payload[offset : offset+32768]
+			offset += 32768
+		}
+	}
+
+	f.SeekChunkSize = chunkSize
+	f.GzidxPoints = points
+	return &solidReadSeeker{f: f, isContinuous: true}, nil
 }
 
 type solidReadSeeker struct {
@@ -927,6 +926,12 @@ func (r *checksumReader) Read(b []byte) (n int, err error) {
 	r.hash.Write(b[:n])
 	// #nosec G115 -- n is the byte count io.Reader.Read returned, which is never negative
 	r.nread += uint64(n)
+	// The reader underneath is an io.LimitReader bounded by the entry's own
+	// uncompressed size, which shortens the slice it passes down but hands
+	// back whatever count came up. Decompressors are registered from
+	// outside this package, so one of them reporting more bytes than it was
+	// given room for is a count no bound here produced, and the entry would
+	// otherwise run past the size it declared.
 	if r.nread > r.f.UncompressedSize64 {
 		return 0, encryptedDataError(r.f, ErrFormat)
 	}
@@ -944,12 +949,10 @@ func (r *checksumReader) Read(b []byte) (n int, err error) {
 				err = io.EOF
 			}
 		} else if r.desr != nil {
+			// readDataDescriptor answers a descriptor it could not read
+			// in full with io.ErrUnexpectedEOF, never with io.EOF.
 			if err1 := readDataDescriptor(r.desr, r.f); err1 != nil {
-				if err1 == io.EOF {
-					err = io.ErrUnexpectedEOF
-				} else {
-					err = err1
-				}
+				err = err1
 			} else if r.hash.Sum32() != r.f.CRC32 {
 				err = ErrChecksum
 			}
@@ -1029,14 +1032,14 @@ func readDirectoryHeader(f *File, r io.Reader) error {
 	f.Name = strings.ReplaceAll(f.Name, "\\", "/")
 	f.Comment = decodeUTF8OrMap([]byte(zipcharset.DecodeText(rawComment, isUTF8, packOS, packVer, f.Extra, true)))
 
-	utf8Valid1, utf8Require1 := detectUTF8(f.Name)
-	utf8Valid2, utf8Require2 := detectUTF8(f.Comment)
-	switch {
-	case !utf8Valid1 || !utf8Valid2:
-		f.NonUTF8 = true
-	case !utf8Require1 && !utf8Require2:
+	// decodeUTF8OrMap answers with valid UTF-8 whatever bytes it is handed,
+	// so neither of these two can be invalid; what is left to decide is
+	// whether the entry needs a flag the archive may not have set.
+	_, utf8Require1 := detectUTF8(f.Name)
+	_, utf8Require2 := detectUTF8(f.Comment)
+	if !utf8Require1 && !utf8Require2 {
 		f.NonUTF8 = false
-	default:
+	} else {
 		f.NonUTF8 = !isUTF8
 	}
 
@@ -1315,11 +1318,10 @@ func readDirectoryEnd(r io.ReaderAt, size int64) (dir *directoryEnd, baseOffset 
 		directoryOffset:    uint64(b.uint32()),
 		commentLen:         b.uint16(),
 	}
-	l := int(d.commentLen)
-	if l > len(b) {
-		return nil, 0, errors.New("zip: invalid comment length")
-	}
-	d.comment = string(b[:l])
+	// findSignatureInBlock answers with an offset only when the end record
+	// and the comment it declares both fit inside the block that was read,
+	// so what is left of the block holds the whole comment.
+	d.comment = string(b[:d.commentLen])
 
 	if d.directoryRecords == 0xffff || d.directorySize == 0xffff || d.directoryOffset == 0xffffffff {
 		p, err := findDirectory64End(r, directoryEndOffset)
