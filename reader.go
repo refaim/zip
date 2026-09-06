@@ -449,6 +449,14 @@ func (f *File) Open() (io.ReadCloser, error) {
 		}
 		rc = dcomp(rr)
 	}
+	// A decompressor is a registered extension point, so the one that just
+	// ran is not necessarily one this package wrote. Nothing downstream can
+	// tell a nil io.ReadCloser from a working one: the limit reader wraps it,
+	// and the entry then fails as a nil dereference on the first read instead
+	// of as an error on the entry.
+	if rc == nil {
+		return nil, fmt.Errorf("zip: the decompressor for method %d built no reader for this entry: %w", method, ErrAlgorithm)
+	}
 	var desr io.Reader
 	if f.hasDataDescriptor() {
 		ddLen := int64(dataDescriptorLen)

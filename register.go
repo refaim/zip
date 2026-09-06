@@ -320,20 +320,24 @@ func newLZMAReader(r io.Reader) io.ReadCloser {
 	// 2 bytes - Properties Size (usually 5)
 	// N bytes - Properties Data (1 byte of parameters + 4 bytes of dictionary size)
 
+	// Every way this header can be wrong is answered with a reader that
+	// reports it. Answering with a nil io.ReadCloser instead leaves the
+	// caller holding something it cannot tell from a working decompressor,
+	// and the entry then fails as a nil dereference rather than as an error.
 	meta := make([]byte, 4)
 	if _, err := io.ReadFull(r, meta); err != nil {
-		return nil
+		return errorReader{fmt.Errorf("zip: entry ends inside its LZMA properties header: %w", ErrFormat)}
 	}
 
 	propSize := int(binary.LittleEndian.Uint16(meta[2:4]))
 	if propSize != 5 {
 		// For ZIP Method 14, 5 bytes of LZMA1 properties are expected per specification.
-		return nil
+		return errorReader{fmt.Errorf("zip: entry declares %d bytes of LZMA properties where APPNOTE 5.8.8 gives 5: %w", propSize, ErrFormat)}
 	}
 
 	props := make([]byte, propSize)
 	if _, err := io.ReadFull(r, props); err != nil {
-		return nil
+		return errorReader{fmt.Errorf("zip: entry ends inside its LZMA properties: %w", ErrFormat)}
 	}
 
 	dictSize := binary.LittleEndian.Uint32(props[1:5])
@@ -354,7 +358,7 @@ func newLZMAReader(r io.Reader) io.ReadCloser {
 	mr := io.MultiReader(bytes.NewReader(fullHeader), r)
 	rd, err := lzma.NewReader(mr)
 	if err != nil {
-		return nil
+		return errorReader{fmt.Errorf("zip: LZMA properties no decoder accepts: %v: %w", err, ErrFormat)}
 	}
 	// lzma.Reader from this package does not implement Close as it works with the stream.
 	// Wrap in NopCloser.

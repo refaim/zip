@@ -460,19 +460,16 @@ func TestPUA_Zip_HardLinkToUndecodableName(t *testing.T) {
 }
 
 // TestPUA_Zip_SolidUndecodableName covers the third way a name reaches the
-// filesystem. A solid archive is one entry holding a whole zip, and its inner
-// entries are read from local headers by extractSolidStream rather than from a
-// central directory by the reader -- so they went to absPath without ever
-// having been through decodeUTF8OrMap either.
+// filesystem: a solid archive, which is one entry holding a whole zip, whose
+// inner names come out of the inner archive rather than out of the one the
+// caller opened.
 func TestPUA_Zip_SolidUndecodableName(t *testing.T) {
 	tmpDir := t.TempDir()
 	rawName := "solid_\xff.txt"
 
-	// The inner entries are read from their local headers, so those headers
-	// have to carry the sizes: extractSolidStream refuses a stored entry that
-	// defers them to a data descriptor, and the refusal would send the
-	// extraction down the temp-file fallback and out through the ordinary
-	// path, which is not the path under test.
+	// The inner entry is written by hand so that its header carries the
+	// sizes and the checksum rather than deferring them to a data
+	// descriptor.
 	payload := []byte("solid-data")
 	var inner bytes.Buffer
 	izw := NewWriter(&inner)

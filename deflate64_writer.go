@@ -201,8 +201,16 @@ func (dw *deflate64Writer) flushBlock(bfinal bool) error {
 	var clCodes []byte
 	var clFreqs [numberOfCodeLengthTreeElements]uint32
 
-	// Collect code lengths sequence
-	allLengths := append(litLengths[:numLitCodes], distLengths[:numDistCodes]...)
+	// Collect code lengths sequence, in a buffer of its own. Appending the
+	// distance lengths onto a slice of litLengths writes them into the
+	// array behind it instead, because a slice of an array has the rest of
+	// that array as spare room: the header below then named one alphabet
+	// and the entry was written with the codes of another, and nothing --
+	// not this package's decoder, not the standard library's -- could read
+	// the result back.
+	allLengths := make([]byte, 0, numLitCodes+numDistCodes)
+	allLengths = append(allLengths, litLengths[:numLitCodes]...)
+	allLengths = append(allLengths, distLengths[:numDistCodes]...)
 	for i := 0; i < len(allLengths); {
 		val := allLengths[i]
 		run := 1

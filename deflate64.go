@@ -292,6 +292,11 @@ type outputWindow struct {
 	window    [windowSize]byte
 	end       int
 	bytesUsed int
+	// produced counts every byte this window has ever held, which is how
+	// far back a match may reach. bytesUsed is only what has not been
+	// handed to the caller yet, and the window is circular, so neither of
+	// them says where the output begins.
+	produced int64
 }
 
 func newOutputWindow() *outputWindow {
@@ -302,10 +307,21 @@ func (ow *outputWindow) writeByte(b byte) {
 	ow.window[ow.end] = b
 	ow.end = (ow.end + 1) & windowMask
 	ow.bytesUsed++
+	ow.produced++
 }
 
-func (ow *outputWindow) writeLengthDistance(length, distance int) {
+func (ow *outputWindow) writeLengthDistance(length, distance int) error {
+	// A match may only reach back into output that exists. A distance past
+	// the start of the stream lands in the part of the window nothing has
+	// written yet, and copying from there hands the caller zeros this
+	// decoder invented: a corrupt stream would come back as a file of
+	// plausible length made partly of bytes nobody wrote. The standard
+	// library's decoder refuses such a stream at exactly this point.
+	if int64(distance) > ow.produced {
+		return errDataError
+	}
 	ow.bytesUsed += length
+	ow.produced += int64(length)
 	from := (ow.end - distance) & windowMask
 	to := ow.end
 
@@ -315,6 +331,7 @@ func (ow *outputWindow) writeLengthDistance(length, distance int) {
 		from = (from + 1) & windowMask
 	}
 	ow.end = to
+	return nil
 }
 
 func (ow *outputWindow) copyFrom(input *inputBuffer, length int) int {
@@ -339,6 +356,7 @@ func (ow *outputWindow) copyFrom(input *inputBuffer, length int) int {
 
 	ow.end = (ow.end + copied) & windowMask
 	ow.bytesUsed += copied
+	ow.produced += int64(copied)
 	return copied
 }
 
@@ -908,7 +926,9 @@ func (im *inflaterManaged) decodeBlock(input *inputBuffer, endOfBlockCodeSeen *b
 			// farthest distance is distanceBasePosition[31] plus its 14 extra
 			// bits, which is tableLookupDistanceMax. Both fit the window, and
 			// the loop above only runs while that much of it is free.
-			im.output.writeLengthDistance(im.length, offset)
+			if err := im.output.writeLengthDistance(im.length, offset); err != nil {
+				return err
+			}
 			freeBytes -= im.length
 			im.state = stateDecodeTop
 		default:
@@ -978,7 +998,9 @@ func (im *inflaterManaged) decodeBlockFastInnerLoop(input *inputBuffer) (int, bo
 			// tableLookupLengthMax and a distance code at
 			// tableLookupDistanceMax, and this loop only runs while the window
 			// has that much room left.
-			im.output.writeLengthDistance(length, offset)
+			if err := im.output.writeLengthDistance(length, offset); err != nil {
+				return 0, false, err
+			}
 		default:
 			return 0, false, errDataError
 		}

@@ -34,6 +34,10 @@ type UpdaterCovFile struct {
 	// seekStartErr, once set, is what a seek to seekStartAt reports.
 	seekStartErr error
 	seekStartAt  int64
+	// seekEndFailAt, when positive, is the number of the "how long is it"
+	// seek that fails; seekEnds counts them.
+	seekEndFailAt int
+	seekEnds      int
 }
 
 func (f *UpdaterCovFile) Read(p []byte) (int, error) {
@@ -73,6 +77,12 @@ func (f *UpdaterCovFile) Write(p []byte) (int, error) {
 }
 
 func (f *UpdaterCovFile) Seek(offset int64, whence int) (int64, error) {
+	if whence == io.SeekEnd {
+		f.seekEnds++
+		if f.seekEndFailAt > 0 && f.seekEnds == f.seekEndFailAt {
+			return 0, errUpdaterCovFail
+		}
+	}
 	if whence == io.SeekCurrent && f.seekCurErr != nil {
 		return 0, f.seekCurErr
 	}
@@ -903,27 +913,6 @@ func TestUpdaterCovReportsAFailedDirectoryWrite(t *testing.T) {
 	}
 }
 
-func TestUpdaterCovReportsALostPositionAfterTheDirectory(t *testing.T) {
-	// Where the directory ended is what the end record is measured
-	// against, so a handle that cannot say where it is has no end record
-	// to write.
-	buf := new(bytes.Buffer)
-	zw := NewWriter(buf)
-	if err := zw.Close(); err != nil {
-		t.Fatalf("closing the writer: %v", err)
-	}
-	u, mem := UpdaterCovOpen(t, buf.Bytes())
-
-	mem.seekCurErr = errUpdaterCovFail
-	err := u.Close()
-	if !errors.Is(err, errUpdaterCovFail) {
-		t.Fatalf("closing gave %v, want the failure of the handle", err)
-	}
-	if !strings.Contains(err.Error(), "write directory") {
-		t.Errorf("error %q does not say the directory was what failed", err)
-	}
-}
-
 func TestUpdaterCovReportsAFailedZip64EndRecordWrite(t *testing.T) {
 	// The end record counts entries in two bytes, so an archive with more
 	// than that carries a zip64 end record and a locator naming it, and a
@@ -948,5 +937,328 @@ func TestUpdaterCovReportsAFailedZip64EndRecordWrite(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "write directory") {
 		t.Errorf("error %q does not say the directory was what failed", err)
+	}
+}
+
+// TestUpdaterCovRemoveLeavesNothingOfTheEntry: an entry that was removed has
+// to be gone from the file, not merely absent from the listing. The removal
+// shifts what follows the entry down over it and leaves the end of the data
+// where it was, so the entry's name and its whole payload used to survive in
+// the bytes past it -- verbatim, for the last entry, which nothing is shifted
+// over at all. The end record used to survive there too, and since a reader
+// looks for one backwards from the end of the file, an archive whose handle
+// could not be shortened came back unreadable.
+func TestUpdaterCovRemoveLeavesNothingOfTheEntry(t *testing.T) {
+	secret := []byte("the contents of the entry that was removed")
+	raw := UpdaterCovArchive(t,
+		UpdaterCovEntry{Name: "keep.txt", Data: []byte("kept")},
+		UpdaterCovEntry{Name: "secret.txt", Data: secret},
+		UpdaterCovEntry{Name: "tail.txt", Data: []byte("after the removal")},
+	)
+
+	for _, tc := range []struct {
+		name  string
+		index int
+	}{
+		{"an entry with another behind it", 1},
+		{"the last entry, which nothing is shifted over", 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, handle := range []struct {
+				name     string
+				truncate bool
+			}{
+				{"a handle that can be shortened", true},
+				{"a handle that cannot", false},
+			} {
+				t.Run(handle.name, func(t *testing.T) {
+					mem := &UpdaterCovFile{data: append([]byte(nil), raw...)}
+					var rws io.ReadWriteSeeker = mem
+					if !handle.truncate {
+						rws = &UpdaterCovPlainFile{file: mem}
+					}
+					u, err := NewUpdater(rws)
+					if err != nil {
+						t.Fatalf("opening the updater: %v", err)
+					}
+
+					if tc.index == 1 {
+						// The entry chosen is the one holding the
+						// secret; the last entry is the one after it.
+						if u.dir[1].Name != "secret.txt" {
+							t.Fatalf("the fixture lists %q where secret.txt was expected", u.dir[1].Name)
+						}
+					}
+					target := u.dir[tc.index].Name
+					if _, err := u.RemoveFile(tc.index); err != nil {
+						t.Fatalf("removing %s: %v", target, err)
+					}
+					if err := u.Close(); err != nil {
+						t.Fatalf("closing the updater: %v", err)
+					}
+
+					got := mem.data
+					if bytes.Contains(got, []byte(target)) {
+						t.Errorf("the name of the removed entry is still in the archive at offset %d", bytes.Index(got, []byte(target)))
+					}
+					if target == "secret.txt" && bytes.Contains(got, secret) {
+						t.Errorf("the payload of the removed entry is still in the archive at offset %d", bytes.Index(got, secret))
+					}
+
+					names := UpdaterCovNames(t, got)
+					for _, n := range names {
+						if n == target {
+							t.Errorf("the archive still lists %q", n)
+						}
+					}
+					if len(names) != 2 {
+						t.Fatalf("the archive lists %v, want the two entries that were kept", names)
+					}
+					if body := UpdaterCovContents(t, got, "keep.txt"); string(body) != "kept" {
+						t.Errorf("keep.txt holds %q, want %q", body, "kept")
+					}
+					if handle.truncate && int64(len(got)) >= int64(len(raw)) {
+						t.Errorf("the archive is %d bytes after the removal, was %d", len(got), len(raw))
+					}
+				})
+			}
+		})
+	}
+}
+
+// TestUpdaterCovRemoveCannotOverwriteWhatItFreed: on a handle that cannot be
+// shortened, the bytes a removal frees are written over with zeros, and a
+// handle that will not take that write leaves the entry where it was -- so the
+// removal has to fail rather than report a file it did not unmake.
+func TestUpdaterCovRemoveCannotOverwriteWhatItFreed(t *testing.T) {
+	raw := UpdaterCovArchive(t,
+		UpdaterCovEntry{Name: "keep.txt", Data: []byte("kept")},
+		UpdaterCovEntry{Name: "last.txt", Data: []byte("the entry to remove")},
+	)
+	mem := &UpdaterCovFile{data: append([]byte(nil), raw...)}
+	u, err := NewUpdater(&UpdaterCovPlainFile{file: mem})
+	if err != nil {
+		t.Fatalf("opening the updater: %v", err)
+	}
+
+	// Removing the last entry shifts nothing, so the only seek to the end
+	// of the data that follows is the one the zero fill makes.
+	// #nosec G115 -- the fixture is a few hundred bytes
+	mem.seekStartAt = int64(u.dir[len(u.dir)-1].offset)
+	mem.seekStartErr = errUpdaterCovFail
+
+	if _, err := u.RemoveFile(len(u.dir) - 1); !errors.Is(err, errUpdaterCovFail) {
+		t.Fatalf("removing the last entry gave %v, want the failure of the handle", err)
+	}
+}
+
+// TestUpdaterCovCloseCannotMeasureWhatItWrote: with no way to shorten the
+// file, the close puts the end record where the file already ends, so it has
+// to ask how long the file is. A handle that will not say is the close's
+// failure.
+func TestUpdaterCovCloseCannotMeasureWhatItWrote(t *testing.T) {
+	raw := UpdaterCovArchive(t,
+		UpdaterCovEntry{Name: "keep.txt", Data: []byte("kept")},
+		UpdaterCovEntry{Name: "last.txt", Data: []byte("the entry to remove")},
+	)
+
+	// A run that works, to learn how many times a removal and a close ask
+	// the handle how long the file is. The last of them is the close's own.
+	counter := &UpdaterCovFile{data: append([]byte(nil), raw...)}
+	cu, err := NewUpdater(&UpdaterCovPlainFile{file: counter})
+	if err != nil {
+		t.Fatalf("opening the updater: %v", err)
+	}
+	if _, err := cu.RemoveFile(len(cu.dir) - 1); err != nil {
+		t.Fatalf("removing the last entry: %v", err)
+	}
+	if err := cu.Close(); err != nil {
+		t.Fatalf("closing the updater: %v", err)
+	}
+
+	mem := &UpdaterCovFile{data: append([]byte(nil), raw...)}
+	u, err := NewUpdater(&UpdaterCovPlainFile{file: mem})
+	if err != nil {
+		t.Fatalf("opening the updater: %v", err)
+	}
+	if _, err := u.RemoveFile(len(u.dir) - 1); err != nil {
+		t.Fatalf("removing the last entry: %v", err)
+	}
+	mem.seekEndFailAt = counter.seekEnds
+	if err := u.Close(); !errors.Is(err, errUpdaterCovFail) {
+		t.Fatalf("closing gave %v, want the failure of the handle", err)
+	}
+}
+
+// TestUpdaterCovRemoveLeavesADirectoryARaderCanFind: a reader looks for the
+// end record backwards from the end of the file over a window of some tens of
+// kilobytes. A removed entry's directory record can be larger than that window
+// by itself -- the format allows a name, an extra field and a comment of 64
+// KiB each -- so on a handle that cannot be shortened, writing the new
+// directory where the data now ends leaves more behind it than a reader will
+// look past, and the archive comes back unreadable however thoroughly what is
+// behind it has been erased.
+func TestUpdaterCovRemoveLeavesADirectoryAReaderCanFind(t *testing.T) {
+	// Each field is capped at 64 KiB on its own, so the record is made
+	// larger than the reader's search window out of two of them: a long
+	// name and an extra field of an id nothing here claims.
+	name := strings.Repeat("v", 20000) + ".txt"
+	extra := make([]byte, 4, 4+60000)
+	binary.LittleEndian.PutUint16(extra[0:2], 0xFFFF)
+	binary.LittleEndian.PutUint16(extra[2:4], 60000)
+	extra = append(extra, bytes.Repeat([]byte{0x2a}, 60000)...)
+
+	buf := new(bytes.Buffer)
+	zw := NewWriter(buf)
+	mustWrite(t, mustCreateHeader(t, zw, &FileHeader{Name: "keep.txt", Method: Store}), []byte("kept"))
+	mustWrite(t, mustCreateHeader(t, zw, &FileHeader{
+		Name:   name,
+		Method: Store,
+		Extra:  extra,
+	}), []byte("the entry to remove"))
+	if err := zw.Close(); err != nil {
+		t.Fatalf("closing the writer: %v", err)
+	}
+	raw := buf.Bytes()
+
+	mem := &UpdaterCovFile{data: append([]byte(nil), raw...)}
+	u, err := NewUpdater(&UpdaterCovPlainFile{file: mem})
+	if err != nil {
+		t.Fatalf("opening the updater: %v", err)
+	}
+	if u.dir[1].Name != name {
+		t.Fatalf("the fixture lists %q where the long name was expected", u.dir[1].Name)
+	}
+	if _, err := u.RemoveFile(1); err != nil {
+		t.Fatalf("removing the entry: %v", err)
+	}
+	if err := u.Close(); err != nil {
+		t.Fatalf("closing the updater: %v", err)
+	}
+
+	got := mem.data
+	if bytes.Contains(got, []byte(name)) {
+		t.Errorf("the name of the removed entry is still in the archive at offset %d", bytes.Index(got, []byte(name)))
+	}
+	if names := UpdaterCovNames(t, got); len(names) != 1 || names[0] != "keep.txt" {
+		t.Fatalf("the archive lists %v, want just keep.txt", names)
+	}
+	if body := UpdaterCovContents(t, got, "keep.txt"); string(body) != "kept" {
+		t.Errorf("keep.txt holds %q, want %q", body, "kept")
+	}
+}
+
+// TestUpdaterCovCloseOnAHandleThatCannotBeShortened: with no way to shorten
+// the file, the close renders the directory once to measure it, writes over
+// the gap that measurement leaves in front of it, seeks there and writes it
+// out. Each of those is the close's failure when the handle refuses it.
+func TestUpdaterCovCloseOnAHandleThatCannotBeShortened(t *testing.T) {
+	raw := UpdaterCovArchive(t,
+		UpdaterCovEntry{Name: "keep.txt", Data: []byte("kept")},
+		UpdaterCovEntry{Name: "last.txt", Data: []byte("the entry to remove")},
+	)
+
+	open := func(t *testing.T) (*Updater, *UpdaterCovFile) {
+		t.Helper()
+		mem := &UpdaterCovFile{data: append([]byte(nil), raw...)}
+		u, err := NewUpdater(&UpdaterCovPlainFile{file: mem})
+		if err != nil {
+			t.Fatalf("opening the updater: %v", err)
+		}
+		return u, mem
+	}
+	removeLast := func(t *testing.T, u *Updater) {
+		t.Helper()
+		if _, err := u.RemoveFile(len(u.dir) - 1); err != nil {
+			t.Fatalf("removing the last entry: %v", err)
+		}
+	}
+
+	t.Run("the directory cannot be rendered", func(t *testing.T) {
+		u, _ := open(t)
+		removeLast(t, u)
+		// A name past what the two-byte field can hold, so the render
+		// that measures the directory refuses it.
+		u.dir[0].Name = strings.Repeat("n", uint16max+1)
+		err := u.Close()
+		if err == nil {
+			t.Fatal("a directory that cannot be rendered was written anyway")
+		}
+		if !strings.Contains(err.Error(), "write directory") {
+			t.Errorf("error %q does not say the directory was what failed", err)
+		}
+	})
+
+	t.Run("the gap in front of it cannot be written over", func(t *testing.T) {
+		u, mem := open(t)
+		removeLast(t, u)
+		mem.writeErr = errUpdaterCovFail
+		if err := u.Close(); !errors.Is(err, errUpdaterCovFail) {
+			t.Fatalf("closing gave %v, want the failure of the handle", err)
+		}
+	})
+
+	t.Run("the place it goes cannot be reached", func(t *testing.T) {
+		// Nothing removed, so the directory goes back exactly where it
+		// was and the offset the seek asks for is the one it started at.
+		u, mem := open(t)
+		mem.seekStartAt = u.dirOffset
+		mem.seekStartErr = errUpdaterCovFail
+		if err := u.Close(); !errors.Is(err, errUpdaterCovFail) {
+			t.Fatalf("closing gave %v, want the failure of the handle", err)
+		}
+	})
+
+	t.Run("the directory cannot be written out", func(t *testing.T) {
+		u, mem := open(t)
+		removeLast(t, u)
+		// Two writes go over the bytes the removal freed, one where it
+		// happened and one where the close puts the directory; the
+		// third is the directory's first record.
+		mem.writeFailAt = 3
+		err := u.Close()
+		if !errors.Is(err, errUpdaterCovFail) {
+			t.Fatalf("closing gave %v, want the failure of the handle", err)
+		}
+		if !strings.Contains(err.Error(), "write directory") {
+			t.Errorf("error %q does not say the directory was what failed", err)
+		}
+	})
+}
+
+// TestUpdaterCovRemoveCompactsWhereItCan: where the file can be shortened, a
+// removal is a compaction. The directory moves back to where the removed entry
+// began and the file ends after it, so the bytes are gone rather than blanked
+// -- an archive of the same length with a hole in it is not what the caller
+// asked for, and every later entry's offset was shifted on the understanding
+// that the data now ends there.
+func TestUpdaterCovRemoveCompactsWhereItCan(t *testing.T) {
+	raw := UpdaterCovArchive(t,
+		UpdaterCovEntry{Name: "keep.txt", Data: []byte("kept")},
+		UpdaterCovEntry{Name: "last.txt", Data: []byte("the entry to remove")},
+	)
+	u, mem := UpdaterCovOpen(t, raw)
+
+	// #nosec G115 -- init holds every entry offset to 0 <= offset <= dirOffset
+	start := int64(u.dir[len(u.dir)-1].offset)
+	if _, err := u.RemoveFile(len(u.dir) - 1); err != nil {
+		t.Fatalf("removing the last entry: %v", err)
+	}
+	if err := u.Close(); err != nil {
+		t.Fatalf("closing the updater: %v", err)
+	}
+
+	got := mem.data
+	end, _, err := readDirectoryEnd(bytes.NewReader(got), int64(len(got)))
+	if err != nil {
+		t.Fatalf("reading the end record back: %v", err)
+	}
+	// #nosec G115 -- the fixture is a few hundred bytes
+	if dirOffset := int64(end.directoryOffset); dirOffset != start {
+		t.Errorf("the directory begins at %d, want %d, where the removed entry did", dirOffset, start)
+	}
+	// #nosec G115 -- the fixture is a few hundred bytes
+	if want := int64(end.directoryOffset) + int64(end.directorySize) + directoryEndLen; int64(len(got)) != want {
+		t.Errorf("the archive is %d bytes, want %d: the end record is not the last thing in it", len(got), want)
 	}
 }

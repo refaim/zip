@@ -1,6 +1,7 @@
 package zip
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"hash/crc32"
@@ -267,6 +268,15 @@ func (u *Updater) AppendHeader(fh *FileHeader, mode AppendMode) (io.Writer, erro
 	if err := u.prepare(fh); err != nil {
 		return nil, err
 	}
+	if err := validateName(fh.Name); err != nil {
+		return nil, err
+	}
+	// As in Writer.CreateHeader: the records this appends to the entry go
+	// behind the caller's bytes, and a reader stops at the first one it
+	// cannot walk past.
+	if err := validateExtra(fh.Extra); err != nil {
+		return nil, err
+	}
 
 	var err error
 	var offset int64 = -1
@@ -434,7 +444,55 @@ func (u *Updater) RemoveFile(dirIndex int) (int64, error) {
 		// #nosec G115 -- u.dir is sorted by offset and every offset is at most dirOffset, so end is never before start
 		u.dir[i].offset -= uint64(size)
 	}
+
+	// The data now ends at wp, and everything from there to where the
+	// directory begins is what the entry left behind: the shift copied what
+	// followed it down over its front and nothing has moved the end of the
+	// data back, so the last entry of an archive survives there verbatim.
+	//
+	// Where the file can be shortened, moving the end of the data back is
+	// the whole answer: Close writes the directory over the leftovers and
+	// cuts the file off after it. Where it cannot, the directory has to stay
+	// where it was -- a reader looks for the end record backwards from the
+	// end of the file and would not find one written a whole entry earlier
+	// -- so what the entry left is written over with zeros instead.
+	if u.truncator() != nil {
+		u.dirOffset = wp
+	} else if err := u.zeroFill(wp, u.dirOffset); err != nil {
+		return 0, err
+	}
 	return wp, nil
+}
+
+// truncator is the handle's Truncate, when it has one. An io.ReadWriteSeeker
+// is not obliged to: an in-memory buffer has no way to give bytes back.
+func (u *Updater) truncator() interface{ Truncate(int64) error } {
+	t, ok := u.rws.(interface{ Truncate(int64) error })
+	if !ok {
+		return nil
+	}
+	return t
+}
+
+// zeroes reads as an endless run of zero bytes.
+type zeroes struct{}
+
+func (zeroes) Read(p []byte) (int, error) {
+	clear(p)
+	return len(p), nil
+}
+
+// zeroFill writes zeros over the archive from one offset up to another. It is
+// how bytes that cannot be cut off the end of the file are unmade.
+func (u *Updater) zeroFill(from, to int64) error {
+	if to <= from {
+		return nil
+	}
+	if _, err := u.rw.Seek(from, io.SeekStart); err != nil {
+		return err
+	}
+	_, err := io.CopyN(u.rw, zeroes{}, to-from)
+	return err
 }
 
 func (u *Updater) Entries() []*FileHeader {
@@ -488,24 +546,64 @@ func (u *Updater) Close() error {
 	// block below moves it past the last one when the updater is closed.
 	start := u.dirOffset
 
-	if _, err := u.rw.Seek(start, io.SeekStart); err != nil {
-		return err
-	}
-
-	if err := u.writeDirectory(start); err != nil {
-		return fmt.Errorf("zip: write directory: %w", err)
-	}
-
 	// Physically truncate the file to the current position (end of EOCD)
-	if t, ok := u.rws.(interface{ Truncate(int64) error }); ok {
-		curr, _ := u.rw.offset()
+	if t := u.truncator(); t != nil {
+		if _, err := u.rw.Seek(start, io.SeekStart); err != nil {
+			return err
+		}
+		curr, err := u.writeDirectory(u.rw, start)
+		if err != nil {
+			return fmt.Errorf("zip: write directory: %w", err)
+		}
 		return t.Truncate(curr)
 	}
 
-	return nil
+	// Nothing here can shorten the file, so the end record is put where the
+	// file already ends rather than where the data now stops. A reader looks
+	// for it backwards from the end of the file over a window of some tens
+	// of kilobytes, and a removed entry's directory record can be larger
+	// than that window all by itself -- a name, an extra field and a comment
+	// of 64 KiB each are all the format allows -- so a directory written
+	// straight after the data can leave more behind it than a reader will
+	// ever look past. Anchored to the end there is nothing behind it at all,
+	// and the gap in front of it, which the format allows, is written over
+	// with zeros so that nothing of the removed entry survives in it.
+	end, err := u.rws.Seek(0, io.SeekEnd)
+	if err != nil {
+		return err
+	}
+	// Rendered once to measure and once at the place that measurement
+	// chooses. The two lengths differ only for an archive whose directory
+	// sits within one entry's record of the four gigabyte line, where the
+	// zip64 end record appears or disappears; the zero fill at the end
+	// covers what is left over then.
+	var measure bytes.Buffer
+	measured, err := u.writeDirectory(&measure, start)
+	if err != nil {
+		return fmt.Errorf("zip: write directory: %w", err)
+	}
+	anchor := max(start, end-(measured-start))
+
+	if err := u.zeroFill(start, anchor); err != nil {
+		return err
+	}
+	if _, err := u.rw.Seek(anchor, io.SeekStart); err != nil {
+		return err
+	}
+	curr, err := u.writeDirectory(u.rw, anchor)
+	if err != nil {
+		return fmt.Errorf("zip: write directory: %w", err)
+	}
+	return u.zeroFill(curr, end)
 }
 
-func (u *Updater) writeDirectory(start int64) error {
+// writeDirectory renders the central directory and the end record to w as
+// though they began at start, and answers the offset they end at. It writes
+// through a counter rather than asking the handle where it is, so that the
+// same rendering can go to a buffer, which is how Close learns how long the
+// directory is before deciding where to put it.
+func (u *Updater) writeDirectory(w io.Writer, start int64) (int64, error) {
+	cw := &countWriter{w: w, count: start}
 	for _, h := range u.dir {
 		var buf = make([]byte, directoryHeaderLen)
 		b := writeBuf(buf)
@@ -517,6 +615,11 @@ func (u *Updater) writeDirectory(start int64) error {
 		b.uint16(h.ModifiedTime)
 		b.uint16(h.ModifiedDate)
 		b.uint32(h.CRC32)
+		// The zip64 record goes in a copy of the entry's extra field
+		// rather than on the entry itself: this rendering may run more
+		// than once, and appending to the header each time would give
+		// the entry one record more every time it ran.
+		extra := h.Extra
 		if h.isZip64() || h.offset >= uint32max {
 			b.uint32(uint32max)
 			b.uint32(uint32max)
@@ -528,7 +631,7 @@ func (u *Updater) writeDirectory(start int64) error {
 			eb.uint64(h.UncompressedSize64)
 			eb.uint64(h.CompressedSize64)
 			eb.uint64(uint64(h.offset))
-			h.Extra = append(h.Extra, buf[:]...)
+			extra = append(append([]byte(nil), h.Extra...), buf[:]...)
 		} else {
 			b.uint32(h.CompressedSize)
 			b.uint32(h.UncompressedSize)
@@ -536,15 +639,15 @@ func (u *Updater) writeDirectory(start int64) error {
 
 		nameLen, err := fitUint16(len(h.Name), "file name")
 		if err != nil {
-			return err
+			return 0, err
 		}
-		extraLen, err := fitUint16(len(h.Extra), "extra field")
+		extraLen, err := fitUint16(len(extra), "extra field")
 		if err != nil {
-			return err
+			return 0, err
 		}
 		commentLen, err := fitUint16(len(h.Comment), "file comment")
 		if err != nil {
-			return err
+			return 0, err
 		}
 		b.uint16(nameLen)
 		b.uint16(extraLen)
@@ -556,23 +659,20 @@ func (u *Updater) writeDirectory(start int64) error {
 		} else {
 			b.uint32(uint32(h.offset))
 		}
-		if _, err := u.rw.Write(buf); err != nil {
-			return err
+		if _, err := cw.Write(buf); err != nil {
+			return 0, err
 		}
-		if _, err := io.WriteString(u.rw, h.Name); err != nil {
-			return err
+		if _, err := io.WriteString(cw, h.Name); err != nil {
+			return 0, err
 		}
-		if _, err := u.rw.Write(h.Extra); err != nil {
-			return err
+		if _, err := cw.Write(extra); err != nil {
+			return 0, err
 		}
-		if _, err := io.WriteString(u.rw, h.Comment); err != nil {
-			return err
+		if _, err := io.WriteString(cw, h.Comment); err != nil {
+			return 0, err
 		}
 	}
-	end, err := u.rw.offset()
-	if err != nil {
-		return err
-	}
+	end := cw.count
 
 	records := uint64(len(u.dir))
 	// #nosec G115 -- end is where writing the directory left off and start is where it began, so the difference is not negative
@@ -601,8 +701,8 @@ func (u *Updater) writeDirectory(start int64) error {
 		b.uint64(uint64(end))
 		b.uint32(1)
 
-		if _, err := u.rw.Write(buf[:]); err != nil {
-			return err
+		if _, err := cw.Write(buf[:]); err != nil {
+			return 0, err
 		}
 
 		records = uint16max
@@ -620,11 +720,11 @@ func (u *Updater) writeDirectory(start int64) error {
 	b.uint32(uint32(offset))
 	// #nosec G115 -- SetComment refuses a comment over uint16max, and one read from an archive came out of a two-byte length
 	b.uint16(uint16(len(u.comment)))
-	if _, err := u.rw.Write(buf[:]); err != nil {
-		return err
+	if _, err := cw.Write(buf[:]); err != nil {
+		return 0, err
 	}
-	if _, err := io.WriteString(u.rw, u.comment); err != nil {
-		return err
+	if _, err := io.WriteString(cw, u.comment); err != nil {
+		return 0, err
 	}
-	return nil
+	return cw.count, nil
 }

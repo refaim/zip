@@ -1165,6 +1165,36 @@ func TestReaderCovDecompressorCannotOverrunTheDeclaredSize(t *testing.T) {
 	}
 }
 
+func TestReaderCovDecompressorThatBuildsNoReaderIsRefused(t *testing.T) {
+	// The same extension point from the other side: a decompressor that
+	// answers a stream it cannot handle with a nil io.ReadCloser. Nothing
+	// downstream can tell that from a working one, so opening the entry has
+	// to be where it stops -- otherwise the limit reader wraps the nil and
+	// the first read dereferences it.
+	body := []byte("0123456789")
+	raw := rawEntryArchive(t, &FileHeader{
+		Name:               "nothing.bin",
+		Method:             77,
+		CompressedSize64:   uint64(len(body)),
+		UncompressedSize64: uint64(len(body)),
+	}, body)
+
+	zr := readerCovOpen(t, raw)
+	zr.RegisterDecompressor(77, func(io.Reader) io.ReadCloser { return nil })
+
+	rc, err := zr.File[0].Open()
+	if err == nil {
+		closeAt(t, rc)
+		t.Fatal("an entry whose decompressor built no reader opened as if it held data")
+	}
+	if !errors.Is(err, ErrAlgorithm) {
+		t.Fatalf("opening the entry gave %v, want ErrAlgorithm", err)
+	}
+	if !strings.Contains(err.Error(), "method 77") {
+		t.Errorf("the error is %q, want it to name the method", err)
+	}
+}
+
 func TestReaderCovEntryShorterThanItDeclaresIsRefused(t *testing.T) {
 	// The entry says a hundred bytes and five are there. Stopping at five
 	// and calling it a file would hand the caller a truncated one.

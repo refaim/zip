@@ -473,6 +473,15 @@ func (w *Writer) CreateHeader(fh *FileHeader) (io.Writer, error) {
 	if err := w.prepare(fh); err != nil {
 		return nil, err
 	}
+	if err := validateName(fh.Name); err != nil {
+		return nil, err
+	}
+	// Everything this writer adds to the entry goes behind whatever the
+	// caller put here, and a reader walks the area from the front, so an
+	// area it cannot walk to the end is an entry it cannot read.
+	if err := validateExtra(fh.Extra); err != nil {
+		return nil, err
+	}
 
 	utf8Valid1, utf8Require1 := detectUTF8(fh.Name)
 	utf8Valid2, utf8Require2 := detectUTF8(fh.Comment)

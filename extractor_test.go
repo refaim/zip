@@ -1084,9 +1084,12 @@ func TestSolidFallback_Zip(t *testing.T) {
 	closeAt(t, f)
 	zw := NewWriter(f)
 
+	// A compressed solid entry is one the extraction cannot read where it
+	// lies, so it goes through the scratch copy the counters below are
+	// about.
 	hdr := &FileHeader{
 		Name:   "Solid.zip",
-		Method: Store,
+		Method: Deflate,
 	}
 	w := mustCreateHeader(t, zw, hdr)
 
@@ -1153,9 +1156,11 @@ func TestSolidFallback_LimitExceeded(t *testing.T) {
 	}
 	closeAt(t, f)
 	zw := NewWriter(f)
+	// Compressed, so that the entry has to be copied out before it can be
+	// read at all and the ceiling on that copy is what answers.
 	hdr := &FileHeader{
 		Name:   "Solid.zip",
-		Method: Store,
+		Method: Deflate,
 	}
 	w := mustCreateHeader(t, zw, hdr)
 	innerZw := NewWriter(w)
@@ -2209,10 +2214,7 @@ type solidEntry struct {
 	data   string
 }
 
-// innerSolidArchive builds the archive that the outer Solid.zip entry holds. A
-// Deflate entry in it is what sends the extraction down the scratch-file
-// fallback: the streaming pass reads inner local headers itself and refuses
-// any method but Store.
+// innerSolidArchive builds the archive that the outer Solid.zip entry holds.
 func innerSolidArchive(t *testing.T, entries []solidEntry) []byte {
 	t.Helper()
 	var buf bytes.Buffer
@@ -2472,11 +2474,10 @@ func TestSolidFallback_DestinationCannotBeCreated(t *testing.T) {
 	}
 }
 
-// TestSolidFallback_ScratchIsNotAnArchive covers a solid entry the fallback
-// cannot make anything of either: a lone local file header is enough for the
-// streaming pass to recognise the start of an archive and refuse its method,
-// and not enough for the second extractor to open the copy. The answer the
-// caller gets is the one the streaming pass gave, and nothing is left behind.
+// TestSolidFallback_ScratchIsNotAnArchive covers a solid entry that is not an
+// archive at all: a lone local file header, with no listing behind it and
+// nothing to salvage. Opening the copy as an archive is where the extraction
+// stops, and nothing is left behind.
 func TestSolidFallback_ScratchIsNotAnArchive(t *testing.T) {
 	tmp := t.TempDir()
 	local := make([]byte, 30)
@@ -2493,8 +2494,8 @@ func TestSolidFallback_ScratchIsNotAnArchive(t *testing.T) {
 	}
 	closeAt(t, e)
 	err = e.Extract(context.Background())
-	if err == nil || !strings.Contains(err.Error(), "sequential extraction not supported") {
-		t.Fatalf("Extract error = %v, want the streaming pass's refusal", err)
+	if !errors.Is(err, ErrFormat) {
+		t.Fatalf("Extract error = %v, want the copy refused as an archive", err)
 	}
 	assertDirHolds(t, dst)
 }
@@ -2568,9 +2569,6 @@ func TestSolidFallback_ScratchCannotBeCreated(t *testing.T) {
 		if !strings.Contains(err.Error(), refused.Error()) {
 			t.Errorf("Extract error %q does not say what went wrong", err)
 		}
-		if !strings.Contains(err.Error(), "sequential extraction not supported") {
-			t.Errorf("Extract error %q does not say what sent it to the fallback", err)
-		}
 		if len(dirs) != 1 || dirs[0] != dst {
 			t.Errorf("the scratch file was asked for in %v, want one attempt in %s", dirs, dst)
 		}
@@ -2616,8 +2614,8 @@ func TestSolidFallback_ScratchCannotBeCreated(t *testing.T) {
 // headerProbeFailer serves an archive from memory and stops serving the one
 // read that File.Open makes before anything else: findBodyOffset asks for the
 // entry's local file header, fileHeaderLen bytes at the entry's own offset.
-// Allowing exactly one of those lets the streaming pass open the entry and
-// leaves the fallback's second open with nothing to open.
+// Allowing none of those lets the central directory be read and leaves the
+// extraction's open of the entry with nothing to open.
 type headerProbeFailer struct {
 	raw    []byte
 	offset int64
@@ -2643,11 +2641,10 @@ func (h *headerProbeFailer) ReadAt(p []byte, off int64) (int, error) {
 	return n, nil
 }
 
-// TestSolidFallback_EntryCannotBeReopened covers the entry that opened once and
-// will not open again. The copy never starts, and the answer the caller gets is
-// the streaming pass's, which is the one that says what is wrong with the
-// archive.
-func TestSolidFallback_EntryCannotBeReopened(t *testing.T) {
+// TestSolidFallback_EntryCannotBeOpened covers the archive that listed the
+// entry and then would not hand it over. The copy never starts, and what the
+// caller is told is what the archive refused.
+func TestSolidFallback_EntryCannotBeOpened(t *testing.T) {
 	inner := innerSolidArchive(t, []solidEntry{{name: "hello.txt", method: Deflate, data: "hello"}})
 	var buf bytes.Buffer
 	zw := NewWriter(&buf)
@@ -2668,18 +2665,18 @@ func TestSolidFallback_EntryCannotBeReopened(t *testing.T) {
 		t.Fatal(err)
 	}
 	closeAt(t, e)
-	// The central directory has been read; from here the entry may be opened
-	// once and no more.
+	// The central directory has been read; from here the entry cannot be
+	// opened at all.
 	probe.offset = e.zr.File[0].headerOffset
 	probe.probes = 0
-	probe.allow = 1
+	probe.allow = 0
 
 	err = e.Extract(context.Background())
-	if err == nil || !strings.Contains(err.Error(), "sequential extraction not supported") {
-		t.Fatalf("Extract error = %v, want the streaming pass's refusal", err)
+	if !errors.Is(err, gone) {
+		t.Fatalf("Extract error = %v, want %v", err, gone)
 	}
-	if probe.probes != 2 {
-		t.Errorf("the entry's header was read %d times, want 2: one open for the stream and one refused for the copy", probe.probes)
+	if probe.probes != 1 {
+		t.Errorf("the entry's header was read %d times, want 1: the one open the copy makes", probe.probes)
 	}
 	assertDirHolds(t, dst)
 }
@@ -2700,8 +2697,8 @@ func (e *erroringCloseReader) Close() error {
 
 // TestSolidFallback_CopyHandleCannotBeClosed covers the copy that read
 // everything and then would not close. The fallback has produced nothing it can
-// vouch for, so the caller is told what the streaming pass found rather than
-// that the extraction worked.
+// vouch for, so the caller is told what the close reported rather than that the
+// extraction worked.
 func TestSolidFallback_CopyHandleCannotBeClosed(t *testing.T) {
 	inner := innerSolidArchive(t, []solidEntry{{name: "hello.txt", method: Deflate, data: "hello"}})
 
@@ -2749,11 +2746,95 @@ func TestSolidFallback_CopyHandleCannotBeClosed(t *testing.T) {
 	})
 
 	err = e.Extract(context.Background())
-	if err == nil || !strings.Contains(err.Error(), "sequential extraction not supported") {
-		t.Fatalf("Extract error = %v, want the streaming pass's refusal", err)
+	if !errors.Is(err, stuck) {
+		t.Fatalf("Extract error = %v, want %v", err, stuck)
 	}
-	if closes != 2 {
-		t.Errorf("the entry's reader was closed %d times, want 2: once after the stream and once after the copy", closes)
+	if closes != 1 {
+		t.Errorf("the entry's reader was closed %d times, want 1: the one close after the copy", closes)
 	}
 	assertDirHolds(t, dst)
+}
+
+// solidStoredArchiveOver puts a stored solid archive behind a probe that can
+// be made to stop serving the entry's local file header.
+func solidStoredArchiveOver(t *testing.T, err error) (*Extractor, *headerProbeFailer) {
+	t.Helper()
+	inner := innerSolidArchive(t, []solidEntry{{name: "hello.txt", method: Store, data: "hello"}})
+	var buf bytes.Buffer
+	zw := NewWriter(&buf)
+	fh := &FileHeader{Name: "Solid.zip", Method: Store}
+	fh.SetMode(0644)
+	mustWrite(t, mustCreateHeader(t, zw, fh), inner)
+	if err := zw.Close(); err != nil {
+		t.Fatalf("close writer: %v", err)
+	}
+	raw := buf.Bytes()
+
+	probe := &headerProbeFailer{raw: raw, allow: len(raw), err: err}
+	e, terr := NewExtractorFromReader(probe, int64(len(raw)), filepath.Join(t.TempDir(), "dst"))
+	if terr != nil {
+		t.Fatal(terr)
+	}
+	closeAt(t, e)
+	// The central directory has been read; from here the entry's header is
+	// served as many times as the caller allows and no more.
+	probe.offset = e.zr.File[0].headerOffset
+	probe.probes = 0
+	return e, probe
+}
+
+// TestSolid_StoredEntryThatCannotBeVerified: a stored solid entry is read
+// where it lies rather than copied out, so its own checksum is verified in a
+// pass of its own first. An archive that will not hand the entry over at all
+// stops there.
+func TestSolid_StoredEntryThatCannotBeVerified(t *testing.T) {
+	gone := errors.New("the archive is no longer readable")
+	e, probe := solidStoredArchiveOver(t, gone)
+	probe.allow = 0
+
+	if err := e.Extract(context.Background()); !errors.Is(err, gone) {
+		t.Fatalf("Extract error = %v, want %v", err, gone)
+	}
+}
+
+// TestSolid_StoredEntryThatStopsBeingLocatable is one step further in: the
+// entry was read and verified, and the archive then would not say where its
+// data begins.
+func TestSolid_StoredEntryThatStopsBeingLocatable(t *testing.T) {
+	gone := errors.New("the archive is no longer readable")
+	e, probe := solidStoredArchiveOver(t, gone)
+	probe.allow = 1
+
+	if err := e.Extract(context.Background()); !errors.Is(err, gone) {
+		t.Fatalf("Extract error = %v, want %v", err, gone)
+	}
+}
+
+// TestSolid_StoredButEncryptedEntryIsNotReadInPlace: a stored solid entry is
+// read where it lies, which is only the inner archive's bytes while nothing
+// stands between them and the file. An encrypted one has the cipher in the
+// way, so it goes through the copy the way a compressed one does; reading its
+// section directly would hand a Reader the ciphertext.
+func TestSolid_StoredButEncryptedEntryIsNotReadInPlace(t *testing.T) {
+	const password = "pw"
+	inner := innerSolidArchive(t, []solidEntry{{name: "hello.txt", method: Store, data: "hello"}})
+	raw := buildZipCryptoStored(t, "Solid.zip", inner, password, byte(crc32.ChecksumIEEE(inner)>>24))
+
+	dst := filepath.Join(t.TempDir(), "dst")
+	e, err := NewExtractorFromReader(bytes.NewReader(raw), int64(len(raw)), dst,
+		WithExtractorPassword(password), WithExtractorConcurrency(1), WithExtractorNoTimes(true))
+	if err != nil {
+		t.Fatalf("building the extractor: %v", err)
+	}
+	closeAt(t, e)
+	if err := e.Extract(context.Background()); err != nil {
+		t.Fatalf("extracting an encrypted solid archive: %v", err)
+	}
+	body, err := os.ReadFile(filepath.Join(dst, "hello.txt"))
+	if err != nil {
+		t.Fatalf("the inner entry was not extracted: %v", err)
+	}
+	if string(body) != "hello" {
+		t.Errorf("hello.txt holds %q, want %q", body, "hello")
+	}
 }

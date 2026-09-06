@@ -3,23 +3,24 @@ package zip
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"hash/crc32"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 )
 
-// The tests here are about extractSolidStream, the pass that unpacks a solid
-// archive by reading the inner archive's local headers as they arrive, and
-// about the two overwrite policies -- unlinkFirst and safeWrites -- on the
-// ordinary path beside it.
+// The tests here are about unpacking a solid archive -- one entry holding a
+// whole archive of its own -- and about the two overwrite policies,
+// unlinkFirst and safeWrites, on the ordinary path beside it.
 
-// storedHeader is the header of an inner entry the streaming pass can read:
-// Store, with the sizes and the checksum in the local header rather than
-// deferred to a data descriptor.
+// storedHeader is the header of an inner entry written by hand: Store, with
+// the sizes and the checksum in the local header rather than deferred to a
+// data descriptor.
 func storedHeader(name string, data []byte) *FileHeader {
 	fh := &FileHeader{
 		Name:               name,
@@ -92,9 +93,8 @@ func failingOwnership(t *testing.T) (ExtractorOption, error) {
 }
 
 // TestExtractSolid_DirectoryEntry covers a solid archive that carries a
-// directory of its own: the streaming pass makes the directory and gives it
-// the entry's metadata, rather than leaving it to be synthesized as some other
-// entry's parent.
+// directory of its own: the directory is made and given the entry's metadata,
+// rather than being left to be synthesized as some other entry's parent.
 func TestExtractSolid_DirectoryEntry(t *testing.T) {
 	raw := solidArchive(t, Store, func(inner *Writer) {
 		rawSolidEntry(t, inner, storedDirHeader("dir/"), nil)
@@ -396,6 +396,136 @@ func TestExtractSolid_ChecksumMismatch(t *testing.T) {
 	}
 }
 
+// innerArchiveWithAnUnlistedEntry lays out an archive by hand whose local
+// headers name two entries while its central directory names only one. Every
+// listing there is -- this package's Reader, Extractor.Files, and every other
+// zip tool -- is built from the central directory, so the first entry is one
+// nothing shows.
+func innerArchiveWithAnUnlistedEntry(unlisted, listed string, body []byte) []byte {
+	var buf bytes.Buffer
+
+	put := func(name string) int {
+		off := buf.Len()
+		lh := make([]byte, 30)
+		binary.LittleEndian.PutUint32(lh[0:4], fileHeaderSignature)
+		binary.LittleEndian.PutUint16(lh[4:6], 20)
+		binary.LittleEndian.PutUint16(lh[8:10], Store)
+		binary.LittleEndian.PutUint32(lh[14:18], crc32.ChecksumIEEE(body))
+		// #nosec G115 -- the body here is a handful of bytes
+		binary.LittleEndian.PutUint32(lh[18:22], uint32(len(body)))
+		// #nosec G115 -- the body here is a handful of bytes
+		binary.LittleEndian.PutUint32(lh[22:26], uint32(len(body)))
+		// #nosec G115 -- the names here are a handful of bytes
+		binary.LittleEndian.PutUint16(lh[26:28], uint16(len(name)))
+		buf.Write(lh)
+		buf.WriteString(name)
+		buf.Write(body)
+		return off
+	}
+
+	_ = put(unlisted)
+	listedOff := put(listed)
+
+	dirOff := buf.Len()
+	ch := make([]byte, 46)
+	binary.LittleEndian.PutUint32(ch[0:4], directoryHeaderSignature)
+	binary.LittleEndian.PutUint16(ch[4:6], 20)
+	binary.LittleEndian.PutUint16(ch[6:8], 20)
+	binary.LittleEndian.PutUint16(ch[10:12], Store)
+	binary.LittleEndian.PutUint32(ch[16:20], crc32.ChecksumIEEE(body))
+	// #nosec G115 -- the body here is a handful of bytes
+	binary.LittleEndian.PutUint32(ch[20:24], uint32(len(body)))
+	// #nosec G115 -- the body here is a handful of bytes
+	binary.LittleEndian.PutUint32(ch[24:28], uint32(len(body)))
+	// #nosec G115 -- the names here are a handful of bytes
+	binary.LittleEndian.PutUint16(ch[28:30], uint16(len(listed)))
+	// #nosec G115 -- the archive is under a hundred bytes
+	binary.LittleEndian.PutUint32(ch[42:46], uint32(listedOff))
+	buf.Write(ch)
+	buf.WriteString(listed)
+
+	end := make([]byte, 22)
+	binary.LittleEndian.PutUint32(end[0:4], directoryEndSignature)
+	binary.LittleEndian.PutUint16(end[8:10], 1)
+	binary.LittleEndian.PutUint16(end[10:12], 1)
+	// #nosec G115 -- the archive is under a hundred bytes
+	binary.LittleEndian.PutUint32(end[12:16], uint32(buf.Len()-dirOff))
+	// #nosec G115 -- the archive is under a hundred bytes
+	binary.LittleEndian.PutUint32(end[16:20], uint32(dirOff))
+	buf.Write(end)
+
+	return buf.Bytes()
+}
+
+// TestExtractSolid_ExtractsOnlyWhatTheListingShows: the entries a viewer shows
+// and the entries a scanner inspects are the ones the central directory names,
+// so those are the entries an extraction may write. An inner archive whose
+// local headers name more than its directory does used to have every one of
+// them extracted, because the pass that unpacked a solid entry read the local
+// headers as they arrived and never looked at the listing at all.
+func TestExtractSolid_ExtractsOnlyWhatTheListingShows(t *testing.T) {
+	for _, outer := range []struct {
+		name   string
+		method uint16
+	}{
+		{"a stored solid entry", Store},
+		{"a deflated solid entry", Deflate},
+	} {
+		t.Run(outer.name, func(t *testing.T) {
+			inner := innerArchiveWithAnUnlistedEntry("ghost.txt", "real.txt", []byte("body"))
+
+			ir, err := NewReader(bytes.NewReader(inner), int64(len(inner)))
+			if err != nil {
+				t.Fatalf("the inner archive itself parses: %v", err)
+			}
+			listed := map[string]bool{}
+			for _, f := range ir.File {
+				listed[f.Name] = true
+			}
+			if listed["ghost.txt"] {
+				t.Fatal("the fixture lists the entry it is supposed to hide")
+			}
+
+			var raw bytes.Buffer
+			zw := NewWriter(&raw)
+			fh := &FileHeader{Name: "Solid.zip", Method: outer.method}
+			fh.SetMode(0644)
+			mustWrite(t, mustCreateHeader(t, zw, fh), inner)
+			if err := zw.Close(); err != nil {
+				t.Fatalf("closing the writer: %v", err)
+			}
+
+			_, dst, xerr := extractArchiveTo(t, raw.Bytes(), WithExtractorConcurrency(1), WithExtractorNoTimes(true))
+			if xerr != nil {
+				t.Fatalf("extracting: %v", xerr)
+			}
+
+			if err := filepath.WalkDir(dst, func(p string, d fs.DirEntry, werr error) error {
+				if werr != nil {
+					return werr
+				}
+				if d.IsDir() {
+					return nil
+				}
+				rel, rerr := filepath.Rel(dst, p)
+				if rerr != nil {
+					return rerr
+				}
+				if name := filepath.ToSlash(rel); !listed[name] {
+					t.Errorf("extraction wrote %q, which the archive's directory does not list", name)
+				}
+				return nil
+			}); err != nil {
+				t.Fatalf("walking the destination: %v", err)
+			}
+
+			if _, serr := os.Lstat(filepath.Join(dst, "real.txt")); serr != nil {
+				t.Errorf("the entry the directory does list was not extracted: %v", serr)
+			}
+		})
+	}
+}
+
 // plainArchive returns an ordinary archive -- one entry, not solid -- for the
 // tests about the overwrite policies on the path beside the solid one.
 func plainArchive(t *testing.T, name string, data []byte) []byte {
@@ -454,3 +584,81 @@ func TestExtractor_UnlinkFirstReturnsARemovalFailure(t *testing.T) {
 // The ordinary path's own safeWrites cases live in
 // extractor_safewrites_test.go, where the move and its failure are driven
 // through the rename seam and run on every platform.
+
+// nestedSolidArchive wraps an ordinary archive in depth solid archives, each
+// one holding the next as its single Solid.zip entry.
+func nestedSolidArchive(t *testing.T, depth int, method uint16) []byte {
+	t.Helper()
+
+	var inner bytes.Buffer
+	zw := NewWriter(&inner)
+	fh := &FileHeader{Name: "hello.txt", Method: Store}
+	fh.SetMode(0644)
+	mustWrite(t, mustCreateHeader(t, zw, fh), []byte("hello"))
+	if err := zw.Close(); err != nil {
+		t.Fatalf("closing the innermost writer: %v", err)
+	}
+	raw := inner.Bytes()
+
+	for i := 0; i < depth; i++ {
+		var outer bytes.Buffer
+		ow := NewWriter(&outer)
+		oh := &FileHeader{Name: "Solid.zip", Method: method}
+		oh.SetMode(0644)
+		mustWrite(t, mustCreateHeader(t, ow, oh), raw)
+		if err := ow.Close(); err != nil {
+			t.Fatalf("closing the writer at level %d: %v", i+1, err)
+		}
+		raw = outer.Bytes()
+	}
+	return raw
+}
+
+// TestExtractSolid_NestingIsBounded: every level of a solid archive inside a
+// solid archive is a whole archive to verify and to read, so the work grows
+// with the square of the size of the outermost one and a few hundred kilobytes
+// buy minutes of it. One level of nesting is more than the archiver ever
+// writes; the level past that is refused before it is read.
+func TestExtractSolid_NestingIsBounded(t *testing.T) {
+	for _, outer := range []struct {
+		name   string
+		method uint16
+	}{
+		{"stored solid entries", Store},
+		{"deflated solid entries", Deflate},
+	} {
+		t.Run(outer.name, func(t *testing.T) {
+			t.Run("as deep as it goes", func(t *testing.T) {
+				_, dst, err := extractArchiveTo(t, nestedSolidArchive(t, maxSolidDepth, outer.method),
+					WithExtractorConcurrency(1), WithExtractorNoTimes(true))
+				if err != nil {
+					t.Fatalf("extracting an archive nested %d deep: %v", maxSolidDepth, err)
+				}
+				body, rerr := os.ReadFile(filepath.Join(dst, "hello.txt"))
+				if rerr != nil {
+					t.Fatalf("the innermost entry was not extracted: %v", rerr)
+				}
+				if string(body) != "hello" {
+					t.Errorf("hello.txt holds %q, want %q", body, "hello")
+				}
+			})
+
+			t.Run("one level further", func(t *testing.T) {
+				_, dst, err := extractArchiveTo(t, nestedSolidArchive(t, maxSolidDepth+1, outer.method),
+					WithExtractorConcurrency(1), WithExtractorNoTimes(true))
+				if !errors.Is(err, errSolidNesting) {
+					t.Fatalf("extracting an archive nested %d deep gave %v, want it refused for its nesting", maxSolidDepth+1, err)
+				}
+				if !strings.Contains(err.Error(), "nested 3 deep") {
+					t.Errorf("the error is %q, want it to name the depth reached", err)
+				}
+				if errors.Is(err, ErrFormat) {
+					t.Errorf("the error is %q, which reads as a malformed archive; it is a well formed one this extractor will not unpack", err)
+				}
+				if _, serr := os.Lstat(filepath.Join(dst, "hello.txt")); !os.IsNotExist(serr) {
+					t.Errorf("the innermost entry was written anyway: %v", serr)
+				}
+			})
+		})
+	}
+}

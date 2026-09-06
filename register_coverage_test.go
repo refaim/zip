@@ -17,6 +17,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -293,21 +294,53 @@ func TestRegisterCovBzip2Entry(t *testing.T) {
 }
 
 // TestRegisterCovLZMAReaderRejectsBadProperties: method 14 puts a four byte
-// version and property size in front of the LZMA properties, and none of the
-// ways that can be wrong may produce a decompressor.
+// version and property size in front of the LZMA properties, and every way
+// that can be wrong has to come back as a reader that reports its own reason.
+// A nil io.ReadCloser is not one of the answers: the caller cannot tell it
+// from a working decompressor, so the entry would fail as a dereference
+// instead.
 func TestRegisterCovLZMAReaderRejectsBadProperties(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		in   []byte
+		want string
 	}{
-		{"a header that stops inside the four leading bytes", []byte{0x09, 0x00, 0x05}},
-		{"a property size other than five", []byte{0x09, 0x00, 0x04, 0x00, 0x5d, 0x00, 0x00, 0x00, 0x00}},
-		{"properties shorter than the size announced", []byte{0x09, 0x00, 0x05, 0x00, 0x5d, 0x00}},
-		{"a properties byte no LZMA decoder accepts", []byte{0x09, 0x00, 0x05, 0x00, 0xff, 0x00, 0x00, 0x00, 0x00}},
+		{
+			"a header that stops inside the four leading bytes",
+			[]byte{0x09, 0x00, 0x05},
+			"ends inside its LZMA properties header",
+		},
+		{
+			"a property size other than five",
+			[]byte{0x09, 0x00, 0x04, 0x00, 0x5d, 0x00, 0x00, 0x00, 0x00},
+			"declares 4 bytes of LZMA properties",
+		},
+		{
+			"properties shorter than the size announced",
+			[]byte{0x09, 0x00, 0x05, 0x00, 0x5d, 0x00},
+			"ends inside its LZMA properties",
+		},
+		{
+			"a properties byte no LZMA decoder accepts",
+			[]byte{0x09, 0x00, 0x05, 0x00, 0xff, 0x00, 0x00, 0x00, 0x00},
+			"LZMA properties no decoder accepts",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if rc := newLZMAReader(bytes.NewReader(tc.in)); rc != nil {
-				t.Error("a decompressor was built for a header it cannot decode")
+			rc := newLZMAReader(bytes.NewReader(tc.in))
+			if rc == nil {
+				t.Fatal("a header it cannot decode was answered with a nil reader")
+			}
+			closeAt(t, rc)
+			_, err := rc.Read(make([]byte, 8))
+			if err == nil {
+				t.Fatal("a header it cannot decode read as if it held data")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("the entry failed with %q, want it to name %q", err, tc.want)
+			}
+			if !errors.Is(err, ErrFormat) {
+				t.Errorf("the entry failed with %q, which is not an ErrFormat", err)
 			}
 		})
 	}
@@ -808,4 +841,62 @@ func TestRegisterCovPPMdIsRefused(t *testing.T) {
 			}
 		}
 	})
+}
+
+// TestRegisterCovPPMdRefusalCostsNothing: the refusal is decided from the
+// method alone, so none of the entry's own bytes are read and nothing the
+// entry names is allocated. Method 98 puts two parameter bytes at the head of
+// the data, one field of which is a model size in megabytes; taking that field
+// at its word meant a hundred byte archive could ask for a hundred and
+// twenty-eight megabytes per entry before a byte of it had been decoded or
+// checksummed, and a payload that is not a PPMd stream could drive the decoder
+// into a division by zero.
+func TestRegisterCovPPMdRefusalCostsNothing(t *testing.T) {
+	// The parameters are an order in the low four bits and a model size in
+	// megabytes, less one, in the eight above them.
+	largestModel := []byte{0x01, 0xff}
+
+	archives := [][]byte{}
+	for _, tc := range []struct {
+		name string
+		body []byte
+	}{
+		{"empty.bin", nil},
+		{"model.bin", append(append([]byte(nil), largestModel...), bytes.Repeat([]byte{0x30}, 64)...)},
+		{"garbage.bin", append([]byte{0x31, 0x30}, "\x00010000"...)},
+	} {
+		archives = append(archives, rawEntryArchive(t, &FileHeader{
+			Name:               tc.name,
+			Method:             98,
+			CompressedSize64:   uint64(len(tc.body)),
+			UncompressedSize64: 1 << 20,
+		}, tc.body))
+	}
+
+	const budget = 32 << 20
+
+	runtime.GC()
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+
+	for _, raw := range archives {
+		zr := readerCovOpen(t, raw)
+		rc, err := zr.File[0].Open()
+		if err != nil {
+			t.Fatalf("opening %s: %v", zr.File[0].Name, err)
+		}
+		got, rerr := io.ReadAll(rc)
+		closeAt(t, rc)
+		if !errors.Is(rerr, ErrAlgorithm) {
+			t.Errorf("reading %s gave %v, want it refused as an algorithm this package cannot read", zr.File[0].Name, rerr)
+		}
+		if len(got) != 0 {
+			t.Errorf("reading %s handed back %d bytes before refusing", zr.File[0].Name, len(got))
+		}
+	}
+
+	runtime.ReadMemStats(&after)
+	if allocated := after.TotalAlloc - before.TotalAlloc; allocated > budget {
+		t.Errorf("three archives of a few hundred bytes allocated %d bytes, past the %d byte budget", allocated, budget)
+	}
 }
