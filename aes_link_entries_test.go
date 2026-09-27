@@ -48,9 +48,9 @@ func aesExtraStrength(extra []byte) (byte, bool) {
 			return 0, false
 		}
 		if tag == winzipAesExtraID && size >= 7 {
-			// The record is a two byte version, the strength, the two
-			// byte vendor and the method the entry would have had.
-			return b[2], true
+			// The record is a two byte version, a two byte vendor ID,
+			// the strength and the method the entry would have had.
+			return b[4], true
 		}
 		b = b[size:]
 	}
