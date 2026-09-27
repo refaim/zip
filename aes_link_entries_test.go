@@ -84,8 +84,8 @@ func TestAESArchiveKeepsItsSymlinksReadable(t *testing.T) {
 		t.Fatal("the archive holds no entry for the link")
 	}
 
-	if link.Method != winzipAesExtraID {
-		t.Errorf("the link entry uses method %d, want %d", link.Method, winzipAesExtraID)
+	if link.Method != winzipAesMethod {
+		t.Errorf("the link entry uses method %d, want %d", link.Method, winzipAesMethod)
 	}
 	if link.Flags&0x1 == 0 {
 		t.Errorf("the link entry carries flags %#04x, which is not marked encrypted", link.Flags)

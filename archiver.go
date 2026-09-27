@@ -894,7 +894,7 @@ func (a *Archiver) writeRawEntry(fi os.FileInfo, hdr *FileHeader, body []byte) e
 		_, _ = cw.Write(body)
 		_ = cw.Close()
 		encoded = buf.Bytes()
-	case hdr.Password != "":
+	case hdr.Password != "" && len(body) > 0:
 		strength := hdr.AESStrength
 		if strength == 0 {
 			strength = 3
@@ -912,6 +912,13 @@ func (a *Archiver) writeRawEntry(fi os.FileInfo, hdr *FileHeader, body []byte) e
 		// authentication code stands in for the CRC.
 		hdr.CRC32 = 0
 	}
+	// A hard link or a device node has no body at all, so a password on
+	// its header has nothing to protect: without the length check above,
+	// this used to reach the AES branch anyway and wrap a WinZip AES frame
+	// (salt, password check, authentication code) around zero bytes of
+	// content, which is exactly the promise with nothing behind it that
+	// createHeaderRaw's own CompressedSize64 guard exists to catch -- but
+	// only catches when it is still zero at that point.
 	// #nosec G115 -- the length of a slice is never negative
 	hdr.CompressedSize64 = uint64(len(encoded))
 
