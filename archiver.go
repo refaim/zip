@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"hash/crc32"
 	"io"
 	"os"
@@ -242,6 +243,15 @@ func NewArchiver(w io.Writer, chroot string, opts ...ArchiverOption) (*Archiver,
 		if err := o(&a.options); err != nil {
 			return nil, err
 		}
+	}
+
+	// Refused here rather than at the first entry: the options are all that
+	// exists yet, so nothing has been written that would have to be undone.
+	if a.options.torrentZip && a.options.password != "" {
+		return nil, fmt.Errorf("zip: a password was given: %w", errTorrentZipEncryption)
+	}
+	if a.options.torrentZip && a.options.encryptCD {
+		return nil, fmt.Errorf("zip: the central directory is to be encrypted: %w", errTorrentZipEncryption)
 	}
 
 	if a.options.torrentZip {
